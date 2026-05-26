@@ -45,7 +45,7 @@ import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
-import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader } from "./services/plugin-loader.js";
+import { getDefaultLocalPluginDir, pluginLoader } from "./services/plugin-loader.js";
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
@@ -240,6 +240,7 @@ export async function createApp(
   setPluginEventBus(eventBus);
   const jobStore = pluginJobStore(db);
   const lifecycle = pluginLifecycleManager(db, { workerManager });
+  const resolvedLocalPluginDir = opts.localPluginDir ?? getDefaultLocalPluginDir();
   const scheduler = createPluginJobScheduler({
     db,
     jobStore,
@@ -261,7 +262,7 @@ export async function createApp(
   const loader = pluginLoader(
     db,
     {
-      localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
+      localPluginDir: resolvedLocalPluginDir,
       migrationDb: opts.pluginMigrationDb,
     },
     {
@@ -319,7 +320,7 @@ export async function createApp(
     res.status(404).json({ error: "API route not found" });
   });
   app.use(pluginUiStaticRoutes(db, {
-    localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
+    localPluginDir: resolvedLocalPluginDir,
   }));
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
