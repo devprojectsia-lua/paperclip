@@ -10,6 +10,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   MODEL_PROFILE_KEYS,
   isEnvironmentDriverSupportedForAdapter,
+  isUuidLike,
   type BillingType,
   type EnvironmentLeaseStatus,
   type ExecutionWorkspace,
@@ -9786,7 +9787,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     },
 
-    getRun,
+    getRun: async (runId: string, opts?: { unsafeFullResultJson?: boolean }) => {
+      if (!isUuidLike(runId)) return null;
+      return getRun(runId, opts);
+    },
 
     getRunLogAccess,
 
