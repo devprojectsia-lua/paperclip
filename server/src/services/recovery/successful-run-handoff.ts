@@ -11,6 +11,8 @@ export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
   "Paperclip needs a disposition before this issue can continue.";
 export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY =
   "Paperclip could not resolve this issue's missing disposition automatically. The issue is blocked on a recovery owner.";
+export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_REVIEW_NOTICE_BODY =
+  "Paperclip could not resolve this issue's missing disposition automatically. The issue needs recovery-owner review.";
 export const LEGACY_SUCCESSFUL_RUN_HANDOFF_NOTICE_PREFIXES = [
   "## This issue still needs a next step",
   "## Successful run missing issue disposition",
@@ -200,11 +202,14 @@ export function buildSuccessfulRunHandoffExhaustedNotice(input: {
   latestHandoffRunStatus: string;
   missingDisposition: string;
 }): SuccessfulRunHandoffNotice {
+  const blocked = input.latestIssueStatus === "blocked";
   return {
-    body: SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
+    body: blocked
+      ? SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY
+      : SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_REVIEW_NOTICE_BODY,
     presentation: systemNoticePresentation({
-      tone: "danger",
-      title: "Missing disposition recovery blocked",
+      tone: blocked ? "danger" : "warning",
+      title: blocked ? "Missing disposition recovery blocked" : "Missing disposition recovery needs review",
     }),
     metadata: {
       version: 1,
