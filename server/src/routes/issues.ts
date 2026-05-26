@@ -679,7 +679,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
   void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
     source: "automation",
     triggerDetail: "system",
-    reason: "issue_commented",
+    reason: "interaction_resolved",
     payload: {
       issueId: input.issue.id,
       interactionId: input.interaction.id,
@@ -699,7 +699,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
       interactionStatus: input.interaction.status,
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
-      wakeReason: "issue_commented",
+      wakeReason: "interaction_resolved",
       source: input.source,
       ...(forceFreshSession ? { forceFreshSession: true } : {}),
       ...(workspaceRefreshReason ? { workspaceRefreshReason } : {}),
