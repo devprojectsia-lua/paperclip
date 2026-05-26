@@ -4688,12 +4688,10 @@ export function issueService(db: Db) {
         throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
       }
 
-      const sameRunAssigneeCondition = checkoutRunId
-        ? and(
-          eq(issues.assigneeAgentId, agentId),
-          or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId)),
-        )
-        : and(eq(issues.assigneeAgentId, agentId), isNull(issues.checkoutRunId));
+      const sameRunAssigneeCondition = and(
+        eq(issues.assigneeAgentId, agentId),
+        isNull(issues.checkoutRunId),
+      );
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
@@ -4721,7 +4719,7 @@ export function issueService(db: Db) {
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
-        return enriched;
+        return { ...enriched, isIdempotent: false };
       }
 
       const current = await db
@@ -4763,7 +4761,7 @@ export function issueService(db: Db) {
           )
           .returning()
           .then((rows) => rows[0] ?? null);
-        if (adopted) return adopted;
+        if (adopted) return { ...adopted, isIdempotent: false };
       }
 
       if (
@@ -4783,11 +4781,11 @@ export function issueService(db: Db) {
           const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
           if (!row) throw notFound("Issue not found");
           const [enriched] = await withIssueLabels(db, [row]);
-          return enriched;
+          return { ...enriched, isIdempotent: false };
         }
       }
 
-      // If this run already owns it and it's in_progress, return it (no self-409)
+      // If this run already owns the issue, return it without logging a second checkout event.
       if (
         current.assigneeAgentId === agentId &&
         current.status === "in_progress" &&
@@ -4796,7 +4794,7 @@ export function issueService(db: Db) {
         const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
         if (!row) throw notFound("Issue not found");
         const [enriched] = await withIssueLabels(db, [row]);
-        return enriched;
+        return { ...enriched, isIdempotent: true };
       }
 
       throw conflict("Issue checkout conflict", {
