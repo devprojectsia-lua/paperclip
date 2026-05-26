@@ -31,6 +31,7 @@ import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
+import { assignedIssueTimeoutRetryCooldownSec } from "../assigned-issue-timeout-cooldown.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -98,7 +99,7 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  "id" | "agentId" | "status" | "finishedAt" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -293,6 +294,18 @@ function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
   );
 }
 
+function isInsideAssignedIssueTimeoutRetryCooldown(
+  latestRun: LatestIssueRun,
+  agent: typeof agents.$inferSelect,
+) {
+  if (latestRun?.status !== "timed_out") return false;
+  const cooldownSec = assignedIssueTimeoutRetryCooldownSec(agent);
+  if (cooldownSec <= 0) return false;
+  const finishedAtMs = latestRun.finishedAt ? new Date(latestRun.finishedAt).getTime() : Number.NaN;
+  if (!Number.isFinite(finishedAtMs)) return false;
+  return Date.now() - finishedAtMs < cooldownSec * 1000;
+}
+
 function isSuccessfulInProgressContinuationRun(latestRun: LatestIssueRun): latestRun is SuccessfulLatestIssueRun {
   return latestRun?.status === "succeeded";
 }
@@ -421,6 +434,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         id: heartbeatRuns.id,
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
+        finishedAt: heartbeatRuns.finishedAt,
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
@@ -2454,6 +2468,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        if (isInsideAssignedIssueTimeoutRetryCooldown(latestRun, agent)) {
+          result.skipped += 1;
+          continue;
+        }
+
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId,
@@ -2566,6 +2585,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (isInsideAssignedIssueTimeoutRetryCooldown(latestRun, agent)) {
         result.skipped += 1;
         continue;
       }
