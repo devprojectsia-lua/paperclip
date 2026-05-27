@@ -118,12 +118,16 @@ let dbStubOverride: Record<string, unknown> | null = null;
 
 function createDbStub(options: {
   lastFailedRunCauseClass?: string | null | undefined;
+  lastFailedRunClassifyConfidence?: string | null | undefined;
+  lastFailedRunCauseReason?: string | null | undefined;
   activeIssueId?: string | null;
 } = {}) {
   if (dbStubOverride) return dbStubOverride;
 
   const causeClass = options.lastFailedRunCauseClass;
   const resolvedCauseClass = causeClass === undefined ? "infrastructure" : causeClass;
+  const resolvedConfidence = options.lastFailedRunClassifyConfidence === undefined ? "primary" : options.lastFailedRunClassifyConfidence;
+  const resolvedCauseReason = options.lastFailedRunCauseReason === undefined ? null : options.lastFailedRunCauseReason;
   // Use explicit undefined check so that null passes through as null (no active issue).
   const issueId = options.activeIssueId === undefined ? activeIssueId : options.activeIssueId;
 
@@ -144,7 +148,12 @@ function createDbStub(options: {
           if (resolvedCauseClass === null) {
             return Promise.resolve([]);
           }
-          return Promise.resolve([{ id: failedRunId, processLossCauseClass: resolvedCauseClass }]);
+          return Promise.resolve([{
+            id: failedRunId,
+            processLossCauseClass: resolvedCauseClass,
+            processLossClassifyConfidence: resolvedConfidence,
+            processLossCauseReason: resolvedCauseReason,
+          }]);
         }
         // Issues query
         return Promise.resolve(issueId ? [{ id: issueId }] : []);
@@ -498,6 +507,64 @@ describe.sequential("POST /agents/:id/reset-infrastructure-status", () => {
         .send({ comment: "attempt from unpermissioned agent" }),
     );
     expect(res.status).toBe(403);
+  }, 20_000);
+
+  // GNO-214 regression: weak-signal gate
+  it("rejects weak-confidence reset without weakSignalAcknowledged (422)", async () => {
+    const app = await createApp(boardActor, {
+      lastFailedRunCauseClass: "infrastructure",
+      lastFailedRunClassifyConfidence: "weak",
+      lastFailedRunCauseReason: "infrastructure_cause(signal_2_clean_stderr)",
+    });
+    const res = await requestApp(app, (base) =>
+      request(base)
+        .post(`/api/agents/${targetAgentId}/reset-infrastructure-status`)
+        .send({ comment: "infra reset, signal_2_clean_stderr" }),
+    );
+    expect(res.status).toBe(422);
+    expect(res.body.error).toMatch(/weakSignalAcknowledged/);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects weak-confidence reset with weakSignalAcknowledged=true but missing reason in comment (422)", async () => {
+    const app = await createApp(boardActor, {
+      lastFailedRunCauseClass: "infrastructure",
+      lastFailedRunClassifyConfidence: "weak",
+      lastFailedRunCauseReason: "infrastructure_cause(signal_2_clean_stderr)",
+    });
+    const res = await requestApp(app, (base) =>
+      request(base)
+        .post(`/api/agents/${targetAgentId}/reset-infrastructure-status`)
+        .send({ comment: "resetting agent, confirmed infra issue", weakSignalAcknowledged: true }),
+    );
+    expect(res.status).toBe(422);
+    expect(res.body.error).toMatch(/verbatim/);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("accepts weak-confidence reset with weakSignalAcknowledged=true and reason cited in comment (200)", async () => {
+    const weakReason = "infrastructure_cause(signal_2_clean_stderr)";
+    const app = await createApp(boardActor, {
+      lastFailedRunCauseClass: "infrastructure",
+      lastFailedRunClassifyConfidence: "weak",
+      lastFailedRunCauseReason: weakReason,
+    });
+    const res = await requestApp(app, (base) =>
+      request(base)
+        .post(`/api/agents/${targetAgentId}/reset-infrastructure-status`)
+        .send({
+          comment: `Acknowledged weak signal: ${weakReason}. Host was dropping processes.`,
+          weakSignalAcknowledged: true,
+        }),
+    );
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      activeIssueId,
+      expect.stringContaining("confidence:weak"),
+      expect.any(Object),
+    );
+    const body = mockIssueService.addComment.mock.calls[0][1] as string;
+    expect(body).toContain(weakReason);
   }, 20_000);
 });
 

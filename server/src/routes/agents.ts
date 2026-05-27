@@ -1997,6 +1997,8 @@ export function agentRoutes(
       .select({
         id: heartbeatRuns.id,
         processLossCauseClass: heartbeatRuns.processLossCauseClass,
+        processLossClassifyConfidence: heartbeatRuns.processLossClassifyConfidence,
+        processLossCauseReason: heartbeatRuns.processLossCauseReason,
       })
       .from(heartbeatRuns)
       .where(
@@ -2014,6 +2016,24 @@ export function agentRoutes(
         "Infrastructure reset requires the most recent failure to be classified as infrastructure (Class B). " +
         `Current classification: ${lastFailedRun?.processLossCauseClass ?? "none"}.`,
       );
+    }
+
+    // §5 weak-signal gate (GNO-214): if confidence is 'weak', the caller must
+    // explicitly acknowledge it and cite the reason string in the comment.
+    if (lastFailedRun.processLossClassifyConfidence === "weak") {
+      if (req.body.weakSignalAcknowledged !== true) {
+        throw unprocessable(
+          "Infrastructure reset denied: classification confidence is 'weak' " +
+          `(reason: ${lastFailedRun.processLossCauseReason ?? "unknown"}). ` +
+          "Set weakSignalAcknowledged=true and include the reason string verbatim in the comment.",
+        );
+      }
+      const reason = lastFailedRun.processLossCauseReason ?? "";
+      if (reason && !(req.body.comment as string).includes(reason)) {
+        throw unprocessable(
+          `Infrastructure reset denied: comment must contain the verbatim weak-signal reason '${reason}'.`,
+        );
+      }
     }
 
     // Write audit comment on the agent's most recent active issue.
@@ -2067,7 +2087,7 @@ export function agentRoutes(
       `- **actor**: ${actorAgentId ? `agent:${actorAgentId}` : `user:${actorUserId}`}`,
       `- **target_agent**: ${targetId}`,
       `- **prev_state**: ${prevState}${prevPauseReason ? ` (pauseReason: ${prevPauseReason})` : ""}`,
-      `- **prev_failure_reason**: ${lastFailedRun.processLossCauseClass} (run: ${lastFailedRun.id})`,
+      `- **prev_failure_reason**: ${lastFailedRun.processLossCauseClass} / confidence:${lastFailedRun.processLossClassifyConfidence ?? "unknown"} / reason:${lastFailedRun.processLossCauseReason ?? "n/a"} (run: ${lastFailedRun.id})`,
       `- **new_state**: idle`,
       `- **run_id**: ${req.headers["x-paperclip-run-id"] ?? "n/a"}`,
       `- **timestamp**: ${new Date().toISOString()}`,

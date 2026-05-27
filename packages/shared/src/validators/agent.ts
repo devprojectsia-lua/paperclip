@@ -144,6 +144,7 @@ export type ResetAgentSession = z.infer<typeof resetAgentSessionSchema>;
 
 export const resetInfrastructureStatusSchema = z.object({
   comment: z.string().min(1),
+  weakSignalAcknowledged: z.boolean().optional(),
 });
 
 export type ResetInfrastructureStatus = z.infer<typeof resetInfrastructureStatusSchema>;

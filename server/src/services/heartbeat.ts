@@ -6741,6 +6741,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: now,
         processLossCauseClass: lossCause.causeClass,
         processLossClassifyConfidence: lossCause.classifyConfidence,
+        processLossCauseReason: lossCause.reason,
         resultJson: mergeRunStopMetadataForAgent(
           { adapterType, adapterConfig },
           "failed",
