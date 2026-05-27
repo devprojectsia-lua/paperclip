@@ -259,18 +259,8 @@ describeEmbeddedPostgres("checkWeakInfraAccumulation", () => {
     // All agents are "alerted" (individual or digest)
     expect(result.alerted).toHaveLength(totalAgents);
 
-    // Verify a digest issue was created (title contains "digest")
-    const digestIssues = await db
-      .select({ title: issues.title })
-      .from(issues)
-      .where(
-        // The digest issue title contains "digest"
-        // We can't use LIKE easily in Drizzle without sql``, so just fetch all and filter
-        (t) => t,
-      );
-    const hasDigest = (await db.select({ title: issues.title }).from(issues)).some((i) =>
-      i.title.toLowerCase().includes("digest"),
-    );
+    const allIssues = await db.select({ title: issues.title }).from(issues);
+    const hasDigest = allIssues.some((i) => i.title.toLowerCase().includes("digest"));
     expect(hasDigest).toBe(true);
   });
 
