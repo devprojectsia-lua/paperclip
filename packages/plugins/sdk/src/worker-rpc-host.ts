@@ -1547,12 +1547,13 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     const rawActor = params.actorContext && typeof params.actorContext === "object"
       ? params.actorContext
       : null;
+    const companyId = stringOrNull(rawActor?.companyId) ?? stringOrNull(params.companyId);
     const actor = Object.freeze({
       type: actorTypeOrSystem(rawActor?.type),
       userId: stringOrNull(rawActor?.userId),
       agentId: stringOrNull(rawActor?.agentId),
       runId: stringOrNull(rawActor?.runId),
-      companyId: stringOrNull(rawActor?.companyId),
+      companyId,
     });
     return Object.freeze({
       actor,
