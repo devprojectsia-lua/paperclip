@@ -984,7 +984,7 @@ describe.sequential("plugin tool and bridge authz", () => {
     });
   });
 
-  it("passes authenticated actor context and overrides spoofed company scope for plugin actions", async () => {
+  it("passes authenticated actor context and preserves plugin-owned action params", async () => {
     readyPlugin();
     const call = vi.fn().mockResolvedValue({ ok: true });
     const { app } = await createApp(boardActor({ runId: runA }), {}, {
@@ -1006,8 +1006,9 @@ describe.sequential("plugin tool and bridge authz", () => {
     expect(res.status).toBe(200);
     expect(call).toHaveBeenCalledWith(pluginId, "performAction", {
       key: "sync",
+      companyId: companyA,
       params: {
-        companyId: companyA,
+        companyId: companyB,
         reviewerUserId: "spoofed-user",
       },
       actorContext: {
@@ -1066,8 +1067,9 @@ describe.sequential("plugin tool and bridge authz", () => {
     expect(res.status).toBe(200);
     expect(call).toHaveBeenCalledWith(pluginId, "performAction", {
       key: "sync",
+      companyId: companyA,
       params: {
-        companyId: companyA,
+        companyId: companyB,
         reviewerAgentId: "spoofed-agent",
       },
       actorContext: {
@@ -1095,8 +1097,9 @@ describe.sequential("plugin tool and bridge authz", () => {
     expect(legacyRes.status).toBe(200);
     expect(call).toHaveBeenCalledWith(pluginId, "performAction", {
       key: "sync",
+      companyId: companyA,
       params: {
-        companyId: companyA,
+        companyId: companyB,
         reviewerAgentId: "spoofed-agent",
       },
       actorContext: {

@@ -734,10 +734,8 @@ export function pluginRoutes(
 
   function actionParamsWithAuthorizedCompanyScope(
     params: Record<string, unknown> | undefined,
-    companyId: string | undefined,
   ): Record<string, unknown> {
-    const base = params ?? {};
-    return companyId === undefined ? base : { ...base, companyId };
+    return params ?? {};
   }
 
   async function validateToolRunContextScope(runContext: ToolRunContext): Promise<string | null> {
@@ -1392,7 +1390,7 @@ export function pluginRoutes(
         {
           key: body.key,
           companyId: companyId ?? null,
-          params: actionParamsWithAuthorizedCompanyScope(body.params, companyId),
+          params: actionParamsWithAuthorizedCompanyScope(body.params),
           actorContext: performActionActorContext(req, companyId),
           renderEnvironment: body.renderEnvironment ?? null,
         },
@@ -1577,7 +1575,7 @@ export function pluginRoutes(
         {
           key,
           companyId: companyId ?? null,
-          params: actionParamsWithAuthorizedCompanyScope(body?.params, companyId),
+          params: actionParamsWithAuthorizedCompanyScope(body?.params),
           actorContext: performActionActorContext(req, companyId),
           renderEnvironment: body?.renderEnvironment ?? null,
         },
