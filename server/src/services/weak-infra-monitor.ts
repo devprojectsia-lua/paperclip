@@ -6,54 +6,35 @@
  * inside a rolling WEAK_INFRA_WINDOW_HOURS window, then creates an alert issue
  * assigned to the first available CTO/CEO agent so they are woken and notified.
  *
- * The check is idempotent: a per-agent in-memory timestamp tracks the last alert
- * so the same agent is not re-alerted within a cooldown equal to the detection
- * window (resets to zero on server restart — acceptable, it just causes one
- * extra alert per restart at most).
+ * F4: Cooldown is persisted in `agent_alert_state` (DB) so restarts do not reset it.
+ * F5: Company-wide rate limit (MAX_ALERTS_PER_HOUR) collapses overflow into a digest.
+ * F6: Alert recipient query uses an explicit status allowlist (idle/running/paused).
  */
 
 import { and, asc, count, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, companies, heartbeatRuns, issues } from "@paperclipai/db";
+import { agentAlertState, agents, companies, heartbeatRuns, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 
 // ---------------------------------------------------------------------------
-// Constants — adjustable without touching call sites
+// Constants
 // ---------------------------------------------------------------------------
 
-/** Number of weak-infra failures that trigger the alert. */
 export const WEAK_INFRA_THRESHOLD = 3;
-
-/** Rolling window (hours) in which failures are counted. */
 export const WEAK_INFRA_WINDOW_HOURS = 24;
 
-/** After an alert fires, do not re-alert for the same agent for this many ms. */
+/** After an alert fires for an agent, do not re-alert for this many ms. */
 const ALERT_COOLDOWN_MS = WEAK_INFRA_WINDOW_HOURS * 60 * 60 * 1000;
 
-// ---------------------------------------------------------------------------
-// In-memory dedup state (per process)
-// ---------------------------------------------------------------------------
+/** Maximum individual alerts per company per hour before switching to digest mode. */
+export const MAX_ALERTS_PER_HOUR = 3;
 
-/** agentId → timestamp of last alert emitted */
-const lastAlertSentAt = new Map<string, number>();
-
-function isInCooldown(agentId: string, now: number): boolean {
-  const last = lastAlertSentAt.get(agentId);
-  return last !== undefined && now - last < ALERT_COOLDOWN_MS;
-}
-
-function markAlertSent(agentId: string, now: number): void {
-  lastAlertSentAt.set(agentId, now);
-}
-
-// Exported for tests only.
-export function _resetAlertState(): void {
-  lastAlertSentAt.clear();
-}
+/** Alert kind tag stored in agent_alert_state. */
+const ALERT_KIND_WEAK_INFRA = "weak_infra";
 
 // ---------------------------------------------------------------------------
-// Core service
+// Public types
 // ---------------------------------------------------------------------------
 
 export interface WeakInfraMonitorDeps {
@@ -62,11 +43,76 @@ export interface WeakInfraMonitorDeps {
 }
 
 export interface WeakInfraCheckResult {
-  /** agentIds that triggered the threshold and had alerts created. */
+  /** agentIds that triggered the threshold and had alerts or digest entries created. */
   alerted: string[];
-  /** agentIds that triggered the threshold but were suppressed by cooldown. */
+  /** agentIds that triggered the threshold but were suppressed by per-agent cooldown. */
   suppressed: string[];
 }
+
+// ---------------------------------------------------------------------------
+// DB-persisted cooldown helpers (F4)
+// ---------------------------------------------------------------------------
+
+async function getLastAlertFiredAt(db: Db, agentId: string): Promise<Date | null> {
+  const rows = await db
+    .select({ lastFiredAt: agentAlertState.lastFiredAt })
+    .from(agentAlertState)
+    .where(
+      and(
+        eq(agentAlertState.agentId, agentId),
+        eq(agentAlertState.alertKind, ALERT_KIND_WEAK_INFRA),
+      ),
+    )
+    .limit(1);
+  return rows[0]?.lastFiredAt ?? null;
+}
+
+async function upsertAlertFiredAt(db: Db, agentId: string, now: Date): Promise<void> {
+  await db
+    .insert(agentAlertState)
+    .values({ agentId, alertKind: ALERT_KIND_WEAK_INFRA, lastFiredAt: now })
+    .onConflictDoUpdate({
+      target: [agentAlertState.agentId, agentAlertState.alertKind],
+      set: { lastFiredAt: now },
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Company-wide rate limit helpers (F5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Count how many distinct agents in the given company have fired a weak-infra
+ * alert within the last hour.  Used to enforce MAX_ALERTS_PER_HOUR.
+ */
+async function countCompanyAlertsInLastHour(db: Db, companyId: string, now: Date): Promise<number> {
+  const windowStart = new Date(now.getTime() - 60 * 60 * 1000);
+  const rows = await db
+    .select({ n: count() })
+    .from(agentAlertState)
+    .innerJoin(agents, eq(agents.id, agentAlertState.agentId))
+    .where(
+      and(
+        eq(agents.companyId, companyId),
+        eq(agentAlertState.alertKind, ALERT_KIND_WEAK_INFRA),
+        gte(agentAlertState.lastFiredAt, windowStart),
+      ),
+    );
+  return Number(rows[0]?.n ?? 0);
+}
+
+// ---------------------------------------------------------------------------
+// Exported reset helper — kept for test ergonomics (no-op in production)
+// ---------------------------------------------------------------------------
+
+/** No-op in production. Tests must clean up the agent_alert_state table directly. */
+export function _resetAlertState(): void {
+  // Cooldown is now persisted in DB; reset by deleting from agent_alert_state in tests.
+}
+
+// ---------------------------------------------------------------------------
+// Core service
+// ---------------------------------------------------------------------------
 
 /**
  * Scan the recent heartbeat_runs table and emit alert issues for any agent that
@@ -82,6 +128,7 @@ export async function checkWeakInfraAccumulation(
   const { db } = deps;
   const now = deps.now ?? new Date();
   const windowStart = new Date(now.getTime() - WEAK_INFRA_WINDOW_HOURS * 60 * 60 * 1000);
+  const nowMs = now.getTime();
 
   // -------------------------------------------------------------------------
   // Step 1: find agents that crossed the threshold in the rolling window
@@ -108,30 +155,84 @@ export async function checkWeakInfraAccumulation(
     return { alerted: [], suppressed: [] };
   }
 
+  // -------------------------------------------------------------------------
+  // Step 2: group by company so the rate limit is applied per-company
+  // -------------------------------------------------------------------------
+  const byCompany = new Map<string, Array<{ agentId: string; weakCount: number }>>();
+  for (const row of rows) {
+    if (!byCompany.has(row.companyId)) byCompany.set(row.companyId, []);
+    byCompany.get(row.companyId)!.push({ agentId: row.agentId, weakCount: Number(row.weakCount) });
+  }
+
   const alerted: string[] = [];
   const suppressed: string[] = [];
-  const nowMs = now.getTime();
 
-  for (const row of rows) {
-    const { agentId, companyId, weakCount } = row;
+  for (const [companyId, agentsAboveThreshold] of byCompany) {
+    // F5: load the current hour's alert count for this company from DB
+    let companyHourCount = await countCompanyAlertsInLastHour(db, companyId, now);
 
-    if (isInCooldown(agentId, nowMs)) {
-      suppressed.push(agentId);
-      continue;
+    const digestCandidates: Array<{ agentId: string; agentName: string; weakCount: number }> = [];
+
+    for (const { agentId, weakCount } of agentsAboveThreshold) {
+      // F4: check per-agent cooldown from DB (survives server restarts)
+      const lastFiredAt = await getLastAlertFiredAt(db, agentId);
+      if (lastFiredAt !== null && nowMs - lastFiredAt.getTime() < ALERT_COOLDOWN_MS) {
+        suppressed.push(agentId);
+        continue;
+      }
+
+      if (companyHourCount < MAX_ALERTS_PER_HOUR) {
+        // Individual alert path — within quota
+        try {
+          await emitWeakInfraAlert({
+            db,
+            agentId,
+            companyId,
+            weakCount,
+            windowHours: WEAK_INFRA_WINDOW_HOURS,
+            now,
+          });
+          await upsertAlertFiredAt(db, agentId, now);
+          companyHourCount++;
+          alerted.push(agentId);
+        } catch (err) {
+          logger.error({ err, agentId, companyId }, "weak-infra alert emission failed");
+        }
+      } else {
+        // F5: company quota exceeded — queue for digest
+        const agentInfo = await getAgentInfo(db, agentId);
+        digestCandidates.push({
+          agentId,
+          agentName: agentInfo?.name ?? agentId,
+          weakCount,
+        });
+        // Mark fired so the agent won't re-queue on the very next check cycle.
+        await upsertAlertFiredAt(db, agentId, now);
+        alerted.push(agentId);
+      }
     }
 
-    try {
-      await emitWeakInfraAlert({ db, agentId, companyId, weakCount: Number(weakCount), windowHours: WEAK_INFRA_WINDOW_HOURS, now });
-      markAlertSent(agentId, nowMs);
-      alerted.push(agentId);
-    } catch (err) {
-      logger.error({ err, agentId, companyId }, "weak-infra alert emission failed");
+    // Emit a single digest issue for all over-quota agents in this company
+    if (digestCandidates.length > 0) {
+      try {
+        await emitWeakInfraDigest({ db, companyId, digestAgents: digestCandidates, now });
+      } catch (err) {
+        logger.error(
+          { err, companyId, digestCount: digestCandidates.length },
+          "weak-infra digest emission failed",
+        );
+      }
     }
   }
 
   if (alerted.length > 0) {
     logger.warn(
-      { alerted, suppressed, threshold: WEAK_INFRA_THRESHOLD, windowHours: WEAK_INFRA_WINDOW_HOURS },
+      {
+        alerted,
+        suppressed,
+        threshold: WEAK_INFRA_THRESHOLD,
+        windowHours: WEAK_INFRA_WINDOW_HOURS,
+      },
       "weak-infra accumulation alert(s) created",
     );
   }
@@ -140,7 +241,7 @@ export async function checkWeakInfraAccumulation(
 }
 
 // ---------------------------------------------------------------------------
-// Alert creation
+// Alert creation helpers
 // ---------------------------------------------------------------------------
 
 async function getCompanyIssuePrefix(db: Db, companyId: string): Promise<string> {
@@ -151,10 +252,12 @@ async function getCompanyIssuePrefix(db: Db, companyId: string): Promise<string>
     .then((rows) => rows[0]?.issuePrefix ?? "PAP");
 }
 
-async function findAlertRecipient(
-  db: Db,
-  companyId: string,
-): Promise<string | null> {
+/**
+ * Find a CTO or CEO agent to receive the alert issue.
+ * F6: uses an explicit status allowlist — only idle/running/paused agents are
+ * considered active recipients. Terminated/removed agents are never included.
+ */
+async function findAlertRecipient(db: Db, companyId: string): Promise<string | null> {
   const roleCandidates = await db
     .select({ id: agents.id })
     .from(agents)
@@ -162,7 +265,7 @@ async function findAlertRecipient(
       and(
         eq(agents.companyId, companyId),
         inArray(agents.role, ["cto", "ceo"]),
-        inArray(agents.status, ["idle", "pending_approval"]),
+        inArray(agents.status, ["idle", "running", "paused"]),
       ),
     )
     .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt))
@@ -171,16 +274,12 @@ async function findAlertRecipient(
   return roleCandidates[0]?.id ?? null;
 }
 
-async function getAgentInfo(
-  db: Db,
-  agentId: string,
-): Promise<{ name: string } | null> {
-  const row = await db
+async function getAgentInfo(db: Db, agentId: string): Promise<{ name: string } | null> {
+  return db
     .select({ name: agents.name })
     .from(agents)
     .where(eq(agents.id, agentId))
     .then((rows) => rows[0] ?? null);
-  return row;
 }
 
 async function findAgentActiveIssue(
@@ -188,7 +287,7 @@ async function findAgentActiveIssue(
   companyId: string,
   agentId: string,
 ): Promise<{ id: string; identifier: string | null; title: string } | null> {
-  const row = await db
+  return db
     .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
     .from(issues)
     .where(
@@ -201,7 +300,6 @@ async function findAgentActiveIssue(
     .orderBy(asc(issues.updatedAt))
     .limit(1)
     .then((rows) => rows[0] ?? null);
-  return row;
 }
 
 async function emitWeakInfraAlert(input: {
@@ -254,11 +352,9 @@ async function emitWeakInfraAlert(input: {
   const issuesSvc = issueService(db);
 
   if (activeIssue) {
-    // Post a structured alert comment on the agent's active issue.
     await issuesSvc.addComment(activeIssue.id, body, {});
   }
 
-  // Also create a dedicated alert issue assigned to CTO/CEO for explicit wakeup.
   await issuesSvc.create(companyId, {
     title: `[weak-infra alert] ${agentName} — ${weakCount} weak-infra failures in ${windowHours}h`,
     description: body,
@@ -268,5 +364,56 @@ async function emitWeakInfraAlert(input: {
     originKind: "weak_infra_alert",
     originId: agentId,
     originFingerprint: `weak_infra_alert:${companyId}:${agentId}:${Math.floor(now.getTime() / ALERT_COOLDOWN_MS)}`,
+  });
+}
+
+/**
+ * F5: Emit a single digest issue when the company-wide hourly rate limit is exceeded.
+ * Instead of N individual alerts, one issue lists all affected agents.
+ */
+async function emitWeakInfraDigest(input: {
+  db: Db;
+  companyId: string;
+  digestAgents: Array<{ agentId: string; agentName: string; weakCount: number }>;
+  now: Date;
+}): Promise<void> {
+  const { db, companyId, digestAgents, now } = input;
+
+  const [recipientId] = await Promise.all([findAlertRecipient(db, companyId)]);
+
+  const agentRows = digestAgents
+    .map((a) => `| **${a.agentName}** | \`${a.agentId}\` | ${a.weakCount} |`)
+    .join("\n");
+
+  const body = [
+    `## ⚠️ Weak-infra digest (rate limit atingido)`,
+    "",
+    `O rate limit company-wide de **${MAX_ALERTS_PER_HOUR} alertas/hora** foi atingido.`,
+    `Os seguintes ${digestAgents.length} agente(s) também cruzaram o threshold mas foram agregados neste digest:`,
+    "",
+    "| Agente | ID | Falhas na janela |",
+    "|--------|-----|-----------------|",
+    agentRows,
+    "",
+    "### Ação recomendada",
+    "",
+    "1. Revisar todos os agentes listados acima.",
+    "2. Se houver evidência de spoofing coordenado, considerar pausar os agentes e escalar.",
+    "3. Se for outage de infra real, verificar o provider e aguardar recuperação.",
+    "",
+    `*Digest gerado em ${now.toISOString()}*`,
+  ].join("\n");
+
+  const issuesSvc = issueService(db);
+  await issuesSvc.create(companyId, {
+    title: `[weak-infra digest] ${digestAgents.length} agente(s) — rate limit atingido`,
+    description: body,
+    status: "todo",
+    priority: "high",
+    assigneeAgentId: recipientId ?? undefined,
+    originKind: "weak_infra_alert",
+    originId: `digest:${companyId}`,
+    // Fingerprint is per-hour so one digest per hour maximum per company.
+    originFingerprint: `weak_infra_digest:${companyId}:${Math.floor(now.getTime() / (60 * 60 * 1000))}`,
   });
 }
