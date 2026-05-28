@@ -596,22 +596,23 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
       continue;
     }
 
-    // ── Diff entries — accumulate into diff_group blocks ──────────
+    // ── Diff entries — accumulate into one fold per file ──────────
     if (entry.kind === "diff") {
       const prev = blocks[blocks.length - 1];
-      if (prev && prev.type === "diff_group") {
-        if (entry.changeType === "file_header") {
-          // New file in the same diff block — update filePath
-          prev.filePath = entry.text;
-        }
+      const startsNewFile = entry.changeType === "file_header";
+
+      if (prev && prev.type === "diff_group" && !startsNewFile) {
         prev.hunks.push({ changeType: entry.changeType, text: entry.text });
         prev.endTs = entry.ts;
       } else {
+        // Hermes can emit several `┊ review diff` blocks back-to-back without
+        // tool separators. Starting a fresh block on every file header prevents
+        // later files/final prose from being folded into the first diff card.
         blocks.push({
           type: "diff_group",
           ts: entry.ts,
           endTs: entry.ts,
-          filePath: entry.changeType === "file_header" ? entry.text : undefined,
+          filePath: startsNewFile ? entry.text : undefined,
           hunks: [{ changeType: entry.changeType, text: entry.text }],
         });
       }

@@ -3618,10 +3618,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null)
       : null;
     const issueProjectId = issueProjectRef?.projectId ?? null;
-    const preferredProjectWorkspaceId =
+    let preferredProjectWorkspaceId =
       issueProjectRef?.projectWorkspaceId ?? contextProjectWorkspaceId ?? null;
-    const resolvedProjectId = issueProjectId ?? contextProjectId;
+    let resolvedProjectId = issueProjectId ?? contextProjectId;
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
+    const configuredAgentCwd = readNonEmptyString(parseObject(agent.adapterConfig)?.cwd);
+
+    if (useProjectWorkspace && !resolvedProjectId && configuredAgentCwd) {
+      const normalizedAgentCwd = path.resolve(configuredAgentCwd);
+      const workspaceMatch = await db
+        .select({
+          id: projectWorkspaces.id,
+          projectId: projectWorkspaces.projectId,
+          cwd: projectWorkspaces.cwd,
+        })
+        .from(projectWorkspaces)
+        .where(eq(projectWorkspaces.companyId, agent.companyId))
+        .orderBy(
+          desc(sql<number>`case when ${projectWorkspaces.isPrimary} then 1 else 0 end`),
+          desc(sql<number>`case when ${projectWorkspaces.repoUrl} is not null then 1 else 0 end`),
+          desc(projectWorkspaces.updatedAt),
+          asc(projectWorkspaces.createdAt),
+          asc(projectWorkspaces.id),
+        )
+        .then((rows) =>
+          rows.find((row) => {
+            const cwd = readNonEmptyString((row as { cwd?: unknown }).cwd);
+            return cwd ? path.resolve(cwd) === normalizedAgentCwd : false;
+          }) ?? null,
+        );
+      if (workspaceMatch) {
+        resolvedProjectId = workspaceMatch.projectId;
+        preferredProjectWorkspaceId = workspaceMatch.id;
+      }
+    }
+
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
 
     const unorderedProjectWorkspaceRows = workspaceProjectId
