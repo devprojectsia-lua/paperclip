@@ -789,6 +789,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
         : undefined;
 
+    const partialUsageFromStream =
+      parsedStream.usagePartial && parsedStream.usage
+        ? {
+            usage: parsedStream.usage,
+            usagePartial: true as const,
+            partialUsageMessages: parsedStream.partialUsageMessages ?? 0,
+          }
+        : null;
+
     if (proc.timedOut) {
       return {
         exitCode: proc.exitCode,
@@ -797,6 +806,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
+        ...(partialUsageFromStream
+          ? {
+              usage: partialUsageFromStream.usage,
+              usagePartial: true,
+              resultJson: {
+                usagePartial: true,
+                partialUsageMessages: partialUsageFromStream.partialUsageMessages,
+              },
+            }
+          : {}),
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
     }
@@ -834,6 +853,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorFamily: transientUpstream ? "transient_upstream" : null,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
         errorMeta,
+        ...(partialUsageFromStream
+          ? { usage: partialUsageFromStream.usage, usagePartial: true }
+          : {}),
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,

@@ -19,6 +19,12 @@ export function parseClaudeStreamJson(stdout: string) {
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  const partialUsage: UsageSummary = {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+  };
+  let partialUsageMessages = 0;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -36,6 +42,17 @@ export function parseClaudeStreamJson(stdout: string) {
     if (type === "assistant") {
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
       const message = parseObject(event.message);
+      const messageUsage = parseObject(message.usage);
+      const inputTokens = asNumber(messageUsage.input_tokens, 0);
+      const outputTokens = asNumber(messageUsage.output_tokens, 0);
+      const cachedInputTokens = asNumber(messageUsage.cache_read_input_tokens, 0);
+      if (inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0) {
+        partialUsage.inputTokens += inputTokens;
+        partialUsage.outputTokens += outputTokens;
+        partialUsage.cachedInputTokens =
+          (partialUsage.cachedInputTokens ?? 0) + cachedInputTokens;
+        partialUsageMessages += 1;
+      }
       const content = Array.isArray(message.content) ? message.content : [];
       for (const entry of content) {
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
@@ -55,11 +72,14 @@ export function parseClaudeStreamJson(stdout: string) {
   }
 
   if (!finalResult) {
+    const hasPartialUsage = partialUsageMessages > 0;
     return {
       sessionId,
       model,
       costUsd: null as number | null,
-      usage: null as UsageSummary | null,
+      usage: hasPartialUsage ? partialUsage : (null as UsageSummary | null),
+      usagePartial: hasPartialUsage,
+      partialUsageMessages,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
     };
@@ -80,6 +100,8 @@ export function parseClaudeStreamJson(stdout: string) {
     model,
     costUsd,
     usage,
+    usagePartial: false,
+    partialUsageMessages,
     summary,
     resultJson: finalResult,
   };

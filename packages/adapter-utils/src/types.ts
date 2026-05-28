@@ -77,6 +77,13 @@ export interface AdapterExecutionResult {
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
   /**
+   * True when `usage` was recovered from streamed-but-not-finalized output —
+   * e.g. the child was SIGKILLed or timed out before emitting a terminal
+   * result frame. Consumers should record the partial telemetry but treat the
+   * numbers as a floor, not a closed total.
+   */
+  usagePartial?: boolean;
+  /**
    * Legacy single session id output. Prefer `sessionParams` + `sessionDisplayId`.
    */
   sessionId?: string | null;
