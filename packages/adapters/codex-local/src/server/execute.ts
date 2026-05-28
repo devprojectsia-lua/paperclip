@@ -23,6 +23,7 @@ import {
   asString,
   asNumber,
   parseObject,
+  parseJson,
   buildPaperclipEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
@@ -91,6 +92,36 @@ function resolveCodexBiller(env: Record<string, string>, billingType: "api" | "s
   const openAiCompatibleBiller = inferOpenAiCompatibleBiller(env, "openai");
   if (openAiCompatibleBiller === "openrouter") return "openrouter";
   return billingType === "subscription" ? "chatgpt" : openAiCompatibleBiller ?? "openai";
+}
+
+const DEFAULT_OUTPUT_INACTIVITY_TIMEOUT_MS = 7 * 60_000;
+
+function resolveOutputInactivityTimeoutMs(config: Record<string, unknown>): number | null {
+  if (config.outputInactivityTimeoutMs === null) return null;
+  const configured = asNumber(config.outputInactivityTimeoutMs, DEFAULT_OUTPUT_INACTIVITY_TIMEOUT_MS);
+  return configured > 0 ? configured : DEFAULT_OUTPUT_INACTIVITY_TIMEOUT_MS;
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+function buildCodexJsonActivityDetector() {
+  let buffer = "";
+  return (stream: "stdout" | "stderr", chunk: string): boolean => {
+    if (stream !== "stdout") return false;
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    return lines.some((rawLine) => {
+      const line = rawLine.trim();
+      if (!line) return false;
+      return parseJson(line) !== null;
+    });
+  };
 }
 
 async function isLikelyPaperclipRepoRoot(candidate: string): Promise<boolean> {
@@ -291,6 +322,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const command = asString(config.command, "codex");
   const model = asString(config.model, "");
+  const outputInactivityTimeoutMs = resolveOutputInactivityTimeoutMs(config);
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -328,9 +360,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const envOverrides: Record<string, string> = {};
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") envOverrides[key] = value;
+  }
   const configuredCodexHome =
-    typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
-      ? path.resolve(envConfig.CODEX_HOME.trim())
+    typeof envOverrides.CODEX_HOME === "string" && envOverrides.CODEX_HOME.trim().length > 0
+      ? path.resolve(envOverrides.CODEX_HOME.trim())
       : null;
   const codexSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = resolveCodexDesiredSkillNames(config, codexSkillEntries);
@@ -342,7 +378,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const preparedManagedCodexHome =
     configuredCodexHome
       ? null
-      : await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
+      : await prepareManagedCodexHome({ ...process.env, ...envOverrides }, onLog, agent.companyId, {
           apiKey: configuredOpenAiApiKey,
         });
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
@@ -480,6 +516,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   if (runtimePrimaryUrl) {
     env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
+  }
+  for (const [k, v] of Object.entries(envOverrides)) {
+    if (k === "CODEX_HOME") continue;
+    env[k] = v;
   }
   env.CODEX_HOME = remoteCodexHome ?? effectiveCodexHome;
   if (!hasExplicitApiKey && authToken) {
@@ -678,6 +718,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
+    const codexJsonActivity = buildCodexJsonActivityDetector();
     const execArgs = buildCodexExecArgs(
       forceSaferInvocation ? { ...config, fastMode: false } : config,
       {
@@ -690,6 +731,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       execArgs.fastModeIgnoredReason == null
         ? commandNotes
         : [...commandNotes, execArgs.fastModeIgnoredReason];
+    const commandNotesWithWatchdog = outputInactivityTimeoutMs == null
+      ? [...commandNotesWithFastMode, "Codex output inactivity watchdog disabled by adapterConfig.outputInactivityTimeoutMs: null."]
+      : [...commandNotesWithFastMode, `Codex output inactivity watchdog armed at ${outputInactivityTimeoutMs}ms.`];
     if (onMeta) {
       await onMeta({
         adapterType: "codex_local",
