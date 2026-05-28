@@ -297,6 +297,37 @@ describeEmbeddedPostgres("checkWeakInfraAccumulation", () => {
     expect(hasDigest).toBe(true);
   });
 
+  it("F5: cooldown is not stamped when digest emit fails", async () => {
+    await seedCompanyAndAgent();
+
+    // Fill company quota with MAX_ALERTS_PER_HOUR individual agents
+    for (let i = 0; i < MAX_ALERTS_PER_HOUR; i++) {
+      const id = randomUUID();
+      await db.insert(agents).values({ id, companyId, name: `Quota${i}`, role: "worker", status: "idle" });
+      for (let j = 0; j < WEAK_INFRA_THRESHOLD; j++) {
+        await insertWeakInfraRun({ agentId: id });
+      }
+    }
+
+    // One more agent that will be routed to the digest path
+    const digestAgentId = randomUUID();
+    await db.insert(agents).values({ id: digestAgentId, companyId, name: "DigestAgent", role: "worker", status: "idle" });
+    for (let j = 0; j < WEAK_INFRA_THRESHOLD; j++) {
+      await insertWeakInfraRun({ agentId: digestAgentId });
+    }
+
+    // Inject a failing emitter
+    await checkWeakInfraAccumulation({
+      db,
+      _emitDigest: async () => { throw new Error("simulated digest failure"); },
+    });
+
+    // Digest agent must NOT have a cooldown stamp — no alert was actually created
+    const allStates = await db.select().from(agentAlertState);
+    const digestAgentState = allStates.filter((s) => s.agentId === digestAgentId);
+    expect(digestAgentState).toHaveLength(0);
+  });
+
   // -------------------------------------------------------------------------
   // F6: Status allowlist — terminated agents never receive alerts
   // -------------------------------------------------------------------------

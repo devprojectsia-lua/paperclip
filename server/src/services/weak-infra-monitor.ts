@@ -40,6 +40,8 @@ const ALERT_KIND_WEAK_INFRA = "weak_infra";
 export interface WeakInfraMonitorDeps {
   db: Db;
   now?: Date;
+  /** @internal — override the digest emitter in tests to simulate failures. */
+  _emitDigest?: typeof emitWeakInfraDigest;
 }
 
 export interface WeakInfraCheckResult {
@@ -206,16 +208,23 @@ export async function checkWeakInfraAccumulation(
           agentName: agentInfo?.name ?? agentId,
           weakCount,
         });
-        // Mark fired so the agent won't re-queue on the very next check cycle.
-        await upsertAlertFiredAt(db, agentId, now);
-        alerted.push(agentId);
+        // Cooldown stamp deferred until after emitWeakInfraDigest succeeds (GNO-252).
       }
     }
 
     // Emit a single digest issue for all over-quota agents in this company
     if (digestCandidates.length > 0) {
       try {
-        await emitWeakInfraDigest({ db, companyId, digestAgents: digestCandidates, now });
+        await (deps._emitDigest ?? emitWeakInfraDigest)({
+          db,
+          companyId,
+          digestAgents: digestCandidates,
+          now,
+        });
+        for (const candidate of digestCandidates) {
+          await upsertAlertFiredAt(db, candidate.agentId, now);
+          alerted.push(candidate.agentId);
+        }
       } catch (err) {
         logger.error(
           { err, companyId, digestCount: digestCandidates.length },
