@@ -4,11 +4,12 @@ declare global {
   namespace Express {
     interface Request {
       actor: {
-        type: "board" | "agent" | "none";
+        type: "board" | "agent" | "service" | "none";
         userId?: string;
         userName?: string | null;
         userEmail?: string | null;
         agentId?: string;
+        serviceTokenId?: string;
         companyId?: string;
         companyIds?: string[];
         memberships?: Array<{
@@ -19,7 +20,8 @@ declare global {
         isInstanceAdmin?: boolean;
         keyId?: string;
         runId?: string;
-        source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant" | "none";
+        scopes?: string[];
+        source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant" | "service_token" | "none";
       };
     }
   }

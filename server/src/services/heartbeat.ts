@@ -172,6 +172,7 @@ import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { classifyProcessLossCause, makeApiHealthCache } from "./process-loss-recovery.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -2457,6 +2458,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const environmentRuntime = options.environmentRuntime ?? environmentRuntimeService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
+  const apiHealthCache = makeApiHealthCache();
+
   const envOrchestrator = environmentRunOrchestrator(db, {
     pluginWorkerManager: options.pluginWorkerManager,
     environmentRuntime,
@@ -6637,6 +6640,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
+    // Signal #4: whether the API responded normally during the previous scheduler tick.
+    // Using the cache from the prior tick makes this zero-latency (no HTTP call).
+    const apiHealthy = apiHealthCache.isHealthy();
+
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -6647,6 +6654,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+
+    // First pass: identify all runs that will be reaped in this batch, grouped by company.
+    // Required for signal #1 (inter-agent correlation within the same company).
+    const willReapByCompany = new Map<string, string[]>();
+    for (const { run, adapterType: runAdapterType } of activeRuns) {
+      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      if (staleThresholdMs > 0) {
+        const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+        if (now.getTime() - refTime < staleThresholdMs) continue;
+      }
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(runAdapterType);
+      if (tracksLocalChild && run.processPid && isProcessAlive(run.processPid)) continue;
+
+      const existing = willReapByCompany.get(run.companyId) ?? [];
+      existing.push(run.id);
+      willReapByCompany.set(run.companyId, existing);
+    }
 
     const reaped: string[] = [];
 
@@ -6693,6 +6717,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
+      // Classify the process loss cause before persisting the failure.
+      // All peers being reaped in this batch (excluding the current run) serve as
+      // signal #1 (inter-agent correlation).
+      const coReapedSameCompanyRunIds = (willReapByCompany.get(run.companyId) ?? []).filter(
+        (id) => id !== run.id,
+      );
+      const lossCause = classifyProcessLossCause(
+        {
+          companyId: run.companyId,
+          stderrExcerpt: run.stderrExcerpt,
+          exitCode: run.exitCode,
+        },
+        { coReapedSameCompanyRunIds, apiHealthy },
+      );
+
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
@@ -6700,6 +6739,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
+        processLossCauseClass: lossCause.causeClass,
+        processLossClassifyConfidence: lossCause.classifyConfidence,
+        processLossCauseReason: lossCause.reason,
         resultJson: mergeRunStopMetadataForAgent(
           { adapterType, adapterConfig },
           "failed",
@@ -6747,6 +6789,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          processLossCauseClass: lossCause.causeClass,
+          processLossClassifyConfidence: lossCause.classifyConfidence,
+          processLossCauseReason: lossCause.reason,
         },
       });
 
@@ -6759,6 +6804,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
+
+    // Mark successful tick so the next reap pass can use signal #4.
+    apiHealthCache.markTick();
+
     return { reaped: reaped.length, runIds: reaped };
   }
 

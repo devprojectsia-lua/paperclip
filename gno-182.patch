@@ -1,0 +1,528 @@
+From 50840caeb6f80ff08af906052222c739fbb788ee Mon Sep 17 00:00:00 2001
+From: "Hephaestus (Paperclip)" <hephaestus@gnomon.labs>
+Date: Wed, 27 May 2026 11:21:59 -0300
+Subject: [PATCH] feat(process-loss): classify infra vs agent cause for process
+ loss events (GNO-182)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements §4 signal #4 (apiHealthy) and the full four-signal classification
+pipeline for process-loss events as specified in GNO-128 §4.
+
+- New `process-loss-recovery.ts`: `classifyProcessLossCause` with four signals
+  (inter-agent correlation, clean stderr, exit 137, API healthy) and confidence
+  tagging (primary vs weak). `makeApiHealthCache` for zero-latency signal #4.
+- `heartbeat.ts`: two-pass reap pre-computes per-company peer lists (signal #1);
+  wires `apiHealthy` from the scheduler health cache; persists
+  `processLossCauseClass` and `processLossClassifyConfidence` on each reaped run;
+  calls `markTick()` at end of successful pass.
+- DB: migrations 0092/0093 add `process_loss_cause_class` and
+  `process_loss_classify_confidence` columns to `heartbeat_runs`.
+- Tests: unit coverage for all four signals, confidence levels, STACK_TRACE_PATTERN
+  variants (V8/Python/JVM), and the TTL cache behaviour.
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>
+---
+ .../0092_process_loss_cause_class.sql         |   1 +
+ .../0093_process_loss_classify_confidence.sql |   1 +
+ packages/db/src/migrations/meta/_journal.json |  14 ++
+ packages/db/src/schema/heartbeat_runs.ts      |   2 +
+ .../__tests__/process-loss-recovery.test.ts   | 167 ++++++++++++++++++
+ server/src/services/heartbeat.ts              |  48 +++++
+ server/src/services/process-loss-recovery.ts  | 147 +++++++++++++++
+ 7 files changed, 380 insertions(+)
+ create mode 100644 packages/db/src/migrations/0092_process_loss_cause_class.sql
+ create mode 100644 packages/db/src/migrations/0093_process_loss_classify_confidence.sql
+ create mode 100644 server/src/__tests__/process-loss-recovery.test.ts
+ create mode 100644 server/src/services/process-loss-recovery.ts
+
+diff --git a/packages/db/src/migrations/0092_process_loss_cause_class.sql b/packages/db/src/migrations/0092_process_loss_cause_class.sql
+new file mode 100644
+index 00000000..0baa60ec
+--- /dev/null
++++ b/packages/db/src/migrations/0092_process_loss_cause_class.sql
+@@ -0,0 +1 @@
++ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "process_loss_cause_class" text;
+diff --git a/packages/db/src/migrations/0093_process_loss_classify_confidence.sql b/packages/db/src/migrations/0093_process_loss_classify_confidence.sql
+new file mode 100644
+index 00000000..4bc42ab2
+--- /dev/null
++++ b/packages/db/src/migrations/0093_process_loss_classify_confidence.sql
+@@ -0,0 +1 @@
++ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "process_loss_classify_confidence" text;
+diff --git a/packages/db/src/migrations/meta/_journal.json b/packages/db/src/migrations/meta/_journal.json
+index 0ff7d2df..78acaf36 100644
+--- a/packages/db/src/migrations/meta/_journal.json
++++ b/packages/db/src/migrations/meta/_journal.json
+@@ -645,6 +645,20 @@
+       "when": 1778810394522,
+       "tag": "0091_old_swarm",
+       "breakpoints": true
++    },
++    {
++      "idx": 92,
++      "version": "7",
++      "when": 1779890400000,
++      "tag": "0092_process_loss_cause_class",
++      "breakpoints": true
++    },
++    {
++      "idx": 93,
++      "version": "7",
++      "when": 1779890401000,
++      "tag": "0093_process_loss_classify_confidence",
++      "breakpoints": true
+     }
+   ]
+ }
+diff --git a/packages/db/src/schema/heartbeat_runs.ts b/packages/db/src/schema/heartbeat_runs.ts
+index c975892a..e83cc7fb 100644
+--- a/packages/db/src/schema/heartbeat_runs.ts
++++ b/packages/db/src/schema/heartbeat_runs.ts
+@@ -54,6 +54,8 @@ export const heartbeatRuns = pgTable(
+     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
+     nextAction: text("next_action"),
+     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
++    processLossCauseClass: text("process_loss_cause_class"),
++    processLossClassifyConfidence: text("process_loss_classify_confidence"),
+     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+   },
+diff --git a/server/src/__tests__/process-loss-recovery.test.ts b/server/src/__tests__/process-loss-recovery.test.ts
+new file mode 100644
+index 00000000..77d0cb56
+--- /dev/null
++++ b/server/src/__tests__/process-loss-recovery.test.ts
+@@ -0,0 +1,167 @@
++import { describe, expect, it } from "vitest";
++import {
++  classifyProcessLossCause,
++  makeApiHealthCache,
++  STACK_TRACE_PATTERN,
++} from "../services/process-loss-recovery.js";
++
++const base = {
++  companyId: "company-1",
++  stderrExcerpt: null,
++  exitCode: null,
++};
++
++describe("classifyProcessLossCause", () => {
++  it("returns agent-cause when no signals fire", () => {
++    const result = classifyProcessLossCause(base);
++    expect(result.causeClass).toBe("agent");
++    expect(result.classifyConfidence).toBe("primary");
++    expect(result.reason).toBe("agent_cause(no_infra_signals)");
++  });
++
++  describe("signal #4 — apiHealthy", () => {
++    it("(a) returns infrastructure when apiHealthy=true and no other signals fire", () => {
++      const result = classifyProcessLossCause(base, { apiHealthy: true });
++      expect(result.causeClass).toBe("infrastructure");
++      expect(result.classifyConfidence).toBe("weak");
++      expect(result.reason).toContain("signal_4_api_healthy");
++    });
++
++    it("(b) absence of apiHealthy (undefined) maintains agent-cause behaviour", () => {
++      const result = classifyProcessLossCause(base, { apiHealthy: undefined });
++      expect(result.causeClass).toBe("agent");
++    });
++
++    it("(b) apiHealthy=false maintains agent-cause behaviour", () => {
++      const result = classifyProcessLossCause(base, { apiHealthy: false });
++      expect(result.causeClass).toBe("agent");
++    });
++  });
++
++  describe("signal #1 — inter-agent correlation (primary signal)", () => {
++    it("returns infrastructure with primary confidence when peers exist", () => {
++      const result = classifyProcessLossCause(base, {
++        coReapedSameCompanyRunIds: ["run-2"],
++      });
++      expect(result.causeClass).toBe("infrastructure");
++      expect(result.classifyConfidence).toBe("primary");
++      expect(result.reason).toContain("signal_1_correlation");
++    });
++
++    it("returns agent-cause when coReapedSameCompanyRunIds is empty", () => {
++      const result = classifyProcessLossCause(base, {
++        coReapedSameCompanyRunIds: [],
++      });
++      expect(result.causeClass).toBe("agent");
++    });
++  });
++
++  describe("signal #2 — clean stderr", () => {
++    it("returns infrastructure when stderr has content without a stack trace", () => {
++      const result = classifyProcessLossCause({
++        ...base,
++        stderrExcerpt: "Out of memory: kill process 12345",
++      });
++      expect(result.causeClass).toBe("infrastructure");
++      expect(result.classifyConfidence).toBe("weak");
++      expect(result.reason).toContain("signal_2_clean_stderr");
++    });
++
++    it("returns agent-cause when stderr contains a V8 stack trace", () => {
++      const result = classifyProcessLossCause({
++        ...base,
++        stderrExcerpt:
++          "Error: something\n    at Object.<anonymous> (/app/index.js:10:5)\n    at Module._compile (node:internal/modules/cjs/loader:1376:14)",
++      });
++      expect(result.causeClass).toBe("agent");
++    });
++
++    it("returns agent-cause when stderr is null", () => {
++      const result = classifyProcessLossCause({ ...base, stderrExcerpt: null });
++      expect(result.causeClass).toBe("agent");
++    });
++
++    it("returns agent-cause when stderr is empty string", () => {
++      const result = classifyProcessLossCause({ ...base, stderrExcerpt: "" });
++      expect(result.causeClass).toBe("agent");
++    });
++  });
++
++  describe("signal #3 — OOM kill (exit 137)", () => {
++    it("returns infrastructure when exitCode is 137", () => {
++      const result = classifyProcessLossCause({ ...base, exitCode: 137 });
++      expect(result.causeClass).toBe("infrastructure");
++      expect(result.classifyConfidence).toBe("weak");
++      expect(result.reason).toContain("signal_3_oom_kill");
++    });
++
++    it("returns agent-cause for other exit codes", () => {
++      for (const code of [0, 1, 2, 127, 136, 138]) {
++        const result = classifyProcessLossCause({ ...base, exitCode: code });
++        expect(result.causeClass).toBe("agent");
++      }
++    });
++  });
++
++  it("signal #1 short-circuits other signals and returns primary confidence", () => {
++    // Even with weak signals present, signal #1 dominates with primary confidence
++    const result = classifyProcessLossCause(
++      { ...base, exitCode: 137, stderrExcerpt: "OOM kill log" },
++      { apiHealthy: true, coReapedSameCompanyRunIds: ["peer-run"] },
++    );
++    expect(result.causeClass).toBe("infrastructure");
++    expect(result.classifyConfidence).toBe("primary");
++    expect(result.reason).toContain("signal_1_correlation");
++  });
++
++  it("combines multiple weak signals in the reason string", () => {
++    const result = classifyProcessLossCause(
++      { ...base, exitCode: 137, stderrExcerpt: "OOM kill log" },
++      { apiHealthy: true },
++    );
++    expect(result.causeClass).toBe("infrastructure");
++    expect(result.classifyConfidence).toBe("weak");
++    expect(result.reason).toContain("signal_2_clean_stderr");
++    expect(result.reason).toContain("signal_3_oom_kill");
++    expect(result.reason).toContain("signal_4_api_healthy");
++  });
++});
++
++describe("STACK_TRACE_PATTERN", () => {
++  it("matches V8 at-style frames", () => {
++    expect(STACK_TRACE_PATTERN.test("    at Object.<anonymous> (/app/index.js:10:5)")).toBe(true);
++  });
++
++  it("matches JVM frames", () => {
++    expect(STACK_TRACE_PATTERN.test("    at com.example.Main.run(Main.java:42)")).toBe(true);
++  });
++
++  it("matches Python frames", () => {
++    expect(STACK_TRACE_PATTERN.test('  File "/app/main.py", line 10')).toBe(true);
++  });
++
++  it("does not match plain log lines", () => {
++    expect(STACK_TRACE_PATTERN.test("Killed")).toBe(false);
++    expect(STACK_TRACE_PATTERN.test("Out of memory")).toBe(false);
++  });
++});
++
++describe("makeApiHealthCache", () => {
++  it("returns false when no tick has been recorded", () => {
++    const cache = makeApiHealthCache(5_000);
++    expect(cache.isHealthy()).toBe(false);
++  });
++
++  it("returns true immediately after markTick()", () => {
++    const cache = makeApiHealthCache(5_000);
++    cache.markTick();
++    expect(cache.isHealthy()).toBe(true);
++  });
++
++  it("returns false after TTL expires", async () => {
++    const cache = makeApiHealthCache(10);
++    cache.markTick();
++    await new Promise((resolve) => setTimeout(resolve, 20));
++    expect(cache.isHealthy()).toBe(false);
++  });
++});
+diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
+index 76ba6307..92147dba 100644
+--- a/server/src/services/heartbeat.ts
++++ b/server/src/services/heartbeat.ts
+@@ -172,6 +172,7 @@ import { environmentRuntimeService } from "./environment-runtime.js";
+ import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
+ import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
+ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
++import { classifyProcessLossCause, makeApiHealthCache } from "./process-loss-recovery.js";
+ 
+ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
+ const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
+@@ -2457,6 +2458,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {})
+   const environmentRuntime = options.environmentRuntime ?? environmentRuntimeService(db, {
+     pluginWorkerManager: options.pluginWorkerManager,
+   });
++  const apiHealthCache = makeApiHealthCache();
++
+   const envOrchestrator = environmentRunOrchestrator(db, {
+     pluginWorkerManager: options.pluginWorkerManager,
+     environmentRuntime,
+@@ -6637,6 +6640,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {})
+     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+     const now = new Date();
+ 
++    // Signal #4: whether the API responded normally during the previous scheduler tick.
++    // Using the cache from the prior tick makes this zero-latency (no HTTP call).
++    const apiHealthy = apiHealthCache.isHealthy();
++
+     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
+     const activeRuns = await db
+       .select({
+@@ -6648,6 +6655,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {})
+       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+       .where(eq(heartbeatRuns.status, "running"));
+ 
++    // First pass: identify all runs that will be reaped in this batch, grouped by company.
++    // Required for signal #1 (inter-agent correlation within the same company).
++    const willReapByCompany = new Map<string, string[]>();
++    for (const { run, adapterType: runAdapterType } of activeRuns) {
++      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
++      if (staleThresholdMs > 0) {
++        const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
++        if (now.getTime() - refTime < staleThresholdMs) continue;
++      }
++      const tracksLocalChild = isTrackedLocalChildProcessAdapter(runAdapterType);
++      if (tracksLocalChild && run.processPid && isProcessAlive(run.processPid)) continue;
++
++      const existing = willReapByCompany.get(run.companyId) ?? [];
++      existing.push(run.id);
++      willReapByCompany.set(run.companyId, existing);
++    }
++
+     const reaped: string[] = [];
+ 
+     for (const { run, adapterType, adapterConfig } of activeRuns) {
+@@ -6693,6 +6717,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {})
+         });
+       }
+ 
++      // Classify the process loss cause before persisting the failure.
++      // All peers being reaped in this batch (excluding the current run) serve as
++      // signal #1 (inter-agent correlation).
++      const coReapedSameCompanyRunIds = (willReapByCompany.get(run.companyId) ?? []).filter(
++        (id) => id !== run.id,
++      );
++      const lossCause = classifyProcessLossCause(
++        {
++          companyId: run.companyId,
++          stderrExcerpt: run.stderrExcerpt,
++          exitCode: run.exitCode,
++        },
++        { coReapedSameCompanyRunIds, apiHealthy },
++      );
++
+       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+ 
+@@ -6700,6 +6739,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {})
+         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+         errorCode: "process_lost",
+         finishedAt: now,
++        processLossCauseClass: lossCause.causeClass,
++        processLossClassifyConfidence: lossCause.classifyConfidence,
+         resultJson: mergeRunStopMetadataForAgent(
+           { adapterType, adapterConfig },
+           "failed",
+@@ -6747,6 +6788,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {})
+           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
+           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
++          processLossCauseClass: lossCause.causeClass,
++          processLossClassifyConfidence: lossCause.classifyConfidence,
++          processLossCauseReason: lossCause.reason,
+         },
+       });
+ 
+@@ -6759,6 +6803,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {})
+     if (reaped.length > 0) {
+       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
+     }
++
++    // Mark successful tick so the next reap pass can use signal #4.
++    apiHealthCache.markTick();
++
+     return { reaped: reaped.length, runIds: reaped };
+   }
+ 
+diff --git a/server/src/services/process-loss-recovery.ts b/server/src/services/process-loss-recovery.ts
+new file mode 100644
+index 00000000..f3f4de08
+--- /dev/null
++++ b/server/src/services/process-loss-recovery.ts
+@@ -0,0 +1,147 @@
++/**
++ * Classifies the cause of a process-loss event as either "infrastructure" or "agent".
++ *
++ * Infrastructure-cause unlocks auto-recovery (§4 of GNO-128 policy).
++ * Agent-cause keeps the current behaviour: mark error, require manual CEO review.
++ *
++ * Four signals (any one is sufficient to classify as infrastructure):
++ *   #1  Correlation — ≥1 other agent in the same company lost its process in the same reap batch.
++ *   #2  Clean stderr — stderr has output but contains no recognisable agent stack trace (infra-only noise).
++ *   #3  OOM / host kill — the process exited with code 137 (SIGKILL from OOM-killer or systemd).
++ *   #4  API healthy — the Paperclip API responded normally at classification time.
++ */
++
++/** Matches V8 (at …), Python (File "…", line …), and JVM (at pkg.Class.method) stack frames. */
++export const STACK_TRACE_PATTERN =
++  /^\s+at\s+[\w$./<>]+\s*\(|^\s+at\s+[\w$./<>]+:\d+|^\s+File\s+"[^"]+",\s+line\s+\d+|^\s+at\s+[\w$.]+\([\w$.]+\.java:\d+\)/m;
++
++export type ProcessLossCauseClass = "infrastructure" | "agent";
++
++export interface ProcessLossInput {
++  /** The company the failed run belongs to — used for signal #1 correlation check. */
++  companyId: string;
++  /** stderr captured during the run, if any. */
++  stderrExcerpt: string | null | undefined;
++  /** Process exit code, if known. */
++  exitCode: number | null | undefined;
++}
++
++export interface ClassifyProcessLossCauseOptions {
++  /**
++   * IDs of OTHER runs (different from the current one) that are being reaped in the same
++   * batch and belong to the same company. Used for signal #1 (inter-agent correlation).
++   */
++  coReapedSameCompanyRunIds?: string[];
++  /**
++   * Signal #4: whether the Paperclip API responded normally at classification time.
++   * Derived from the lightweight scheduler health cache — see `makeApiHealthCache`.
++   */
++  apiHealthy?: boolean;
++}
++
++/**
++ * Confidence level of the `causeClass` classification.
++ *
++ * "primary" — the firing signal cannot be forged by the agent process itself:
++ *   - Signal #1 (inter-agent correlation): written by the reaper, not the agent.
++ *   - "agent" cause: absence of ALL infra signals is itself safe evidence.
++ *
++ * "weak" — the firing signal is writable by the agent process and therefore
++ *   susceptible to spoofing via `process.stderr.write(...)` or `process.exit(137)`:
++ *   - Signal #2 (clean stderr)
++ *   - Signal #3 (exit code 137)
++ *   - Signal #4 (apiHealthy — absence of evidence, not agent-controlled per se,
++ *                but paired with weak signals it cannot strengthen confidence)
++ *
++ * A run with classifyConfidence="weak" and causeClass="infrastructure" should be
++ * treated with reduced trust in abuse-detection pipelines. Repeated weak-infra
++ * classifications from the same agent within a short window are a heuristic
++ * indicator of possible spoofing.
++ */
++export type ClassifyConfidence = "primary" | "weak";
++
++export interface ProcessLossCauseResult {
++  causeClass: ProcessLossCauseClass;
++  /** Signal strength of this classification. */
++  classifyConfidence: ClassifyConfidence;
++  /** Human-readable explanation of which signal(s) fired. */
++  reason: string;
++}
++
++export function classifyProcessLossCause(
++  input: ProcessLossInput,
++  options?: ClassifyProcessLossCauseOptions,
++): ProcessLossCauseResult {
++  // Signal #1 — inter-agent correlation in the same company (PRIMARY — not agent-controllable)
++  if (options?.coReapedSameCompanyRunIds && options.coReapedSameCompanyRunIds.length > 0) {
++    const peers = options.coReapedSameCompanyRunIds.length;
++    return {
++      causeClass: "infrastructure",
++      classifyConfidence: "primary",
++      reason: `infrastructure_cause(signal_1_correlation(peers=${peers}))`,
++    };
++  }
++
++  const weakSignals: string[] = [];
++
++  // Signal #2 — stderr present but contains no agent stack trace (WEAK — agent-writable)
++  if (
++    input.stderrExcerpt &&
++    input.stderrExcerpt.trim().length > 0 &&
++    !STACK_TRACE_PATTERN.test(input.stderrExcerpt)
++  ) {
++    weakSignals.push("signal_2_clean_stderr");
++  }
++
++  // Signal #3 — OOM kill or SIGKILL (exit code 137 = 128 + SIGKILL) (WEAK — agent-writable)
++  if (input.exitCode === 137) {
++    weakSignals.push("signal_3_oom_kill");
++  }
++
++  // Signal #4 — API healthy at classification time (WEAK — absence of evidence)
++  if (options?.apiHealthy === true) {
++    weakSignals.push("signal_4_api_healthy");
++  }
++
++  if (weakSignals.length > 0) {
++    return {
++      causeClass: "infrastructure",
++      classifyConfidence: "weak",
++      reason: `infrastructure_cause(${weakSignals.join(",")})`,
++    };
++  }
++
++  return {
++    causeClass: "agent",
++    classifyConfidence: "primary",
++    reason: "agent_cause(no_infra_signals)",
++  };
++}
++
++/**
++ * Lightweight in-memory health cache for signal #4.
++ *
++ * Records the timestamp of the last successful scheduler tick. When `reapOrphanedRuns`
++ * runs, it calls `markTick()` at the *end* of a successful pass. The next invocation
++ * then reads `isHealthy()` to determine whether a recent tick has completed.
++ *
++ * TTL is 5 s — short enough to be meaningless during normal operation (ticks every
++ * 30 s), but long enough to cover the tail of a slow tick without false negatives.
++ */
++export interface ApiHealthCache {
++  markTick(): void;
++  isHealthy(): boolean;
++}
++
++export function makeApiHealthCache(ttlMs = 5_000): ApiHealthCache {
++  let lastTickAt: number | null = null;
++  return {
++    markTick() {
++      lastTickAt = Date.now();
++    },
++    isHealthy() {
++      if (lastTickAt === null) return false;
++      return Date.now() - lastTickAt < ttlMs;
++    },
++  };
++}
+-- 
+2.47.3
+

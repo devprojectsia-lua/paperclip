@@ -1,5 +1,7 @@
+import { randomBytes, createHash } from "node:crypto";
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
+import { serviceTokens } from "@paperclipai/db";
 import {
   issueGraphLivenessAutoRecoveryRequestSchema,
   patchInstanceExperimentalSettingsSchema,
@@ -146,6 +148,41 @@ export function instanceSettingsRoutes(db: Db) {
       res.json(result);
     },
   );
+
+  router.post("/instance/service-tokens", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    if (!req.actor.isInstanceAdmin) {
+      throw forbidden("Instance admin access required to create service tokens");
+    }
+    const { name, companyId, scopes, description } = req.body as {
+      name: string;
+      companyId: string;
+      scopes: string[];
+      description?: string;
+    };
+    if (!name || !companyId || !Array.isArray(scopes) || scopes.length === 0) {
+      res.status(422).json({ error: "name, companyId, and scopes are required" });
+      return;
+    }
+    const plaintext = randomBytes(32).toString("hex");
+    const tokenHash = createHash("sha256").update(plaintext).digest("hex");
+    const createdByUserId =
+      req.actor.type === "board" && req.actor.userId && req.actor.userId !== "local-board"
+        ? req.actor.userId
+        : null;
+    const [row] = await db
+      .insert(serviceTokens)
+      .values({
+        companyId,
+        tokenHash,
+        name,
+        scopes,
+        description: description ?? null,
+        createdByUserId,
+      })
+      .returning();
+    res.status(201).json({ id: row.id, token: plaintext, name: row.name, scopes: row.scopes, companyId: row.companyId });
+  });
 
   return router;
 }
