@@ -58,6 +58,47 @@ describe("RunTranscriptView", () => {
     expect(html).toMatch(/<li[^>]*>second<\/li>/);
   });
 
+  it("starts a new diff fold for each file header", () => {
+    const entries = [
+      {
+        kind: "diff",
+        ts: "2026-03-12T00:00:00.000Z",
+        changeType: "file_header",
+        text: "docs/first.md",
+      },
+      {
+        kind: "diff",
+        ts: "2026-03-12T00:00:01.000Z",
+        changeType: "add",
+        text: "first",
+      },
+      {
+        kind: "diff",
+        ts: "2026-03-12T00:00:02.000Z",
+        changeType: "file_header",
+        text: "docs/second.md",
+      },
+      {
+        kind: "diff",
+        ts: "2026-03-12T00:00:03.000Z",
+        changeType: "remove",
+        text: "second",
+      },
+      {
+        kind: "assistant",
+        ts: "2026-03-12T00:00:04.000Z",
+        text: "Final summary",
+      },
+    ] as TranscriptEntry[];
+
+    const blocks = normalizeTranscript(entries, false);
+
+    expect(blocks.map((block) => block.type)).toEqual(["diff_group", "diff_group", "message"]);
+    expect(blocks[0]).toMatchObject({ type: "diff_group", filePath: "docs/first.md" });
+    expect(blocks[1]).toMatchObject({ type: "diff_group", filePath: "docs/second.md" });
+    expect(blocks[2]).toMatchObject({ type: "message", text: "Final summary" });
+  });
+
   it("hides saved-session resume skip stderr from nice mode normalization", () => {
     const entries: TranscriptEntry[] = [
       {

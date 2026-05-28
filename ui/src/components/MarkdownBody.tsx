@@ -1,6 +1,6 @@
 import { isValidElement, useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Check, Copy, ExternalLink, Github, WrapText } from "lucide-react";
+import { Check, Copy, ExternalLink, FileText, Github, WrapText } from "lucide-react";
 import Markdown, { defaultUrlTransform, type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "../lib/utils";
@@ -158,7 +158,80 @@ function extractMermaidSource(children: ReactNode): string | null {
   return flattenText(childProps.children).replace(/\n$/, "");
 }
 
+const localFileReferencePattern = /(file:\/\/\/[^\s<>"')\]]+|(?:\/mnt\/[A-Za-z]\/|\/home\/|\/tmp\/|\/workspace\/)[^\s<>"')\]]*)/g;
+
+function isLocalFileHref(href: string | null | undefined): boolean {
+  if (!href) return false;
+  if (href.startsWith("file:///")) return true;
+  return /^(?:\/mnt\/[A-Za-z]\/|\/home\/|\/tmp\/|\/workspace\/)/.test(href);
+}
+
+function normalizeLocalFileHref(raw: string): string {
+  if (raw.startsWith("file:///")) {
+    try {
+      return new URL(raw).href;
+    } catch {
+      return raw.replace(/ /g, "%20");
+    }
+  }
+
+  const encodedPath = raw
+    .split("/")
+    .map((segment, index) => (index === 0 ? "" : encodeURIComponent(segment)))
+    .join("/");
+  return `file://${encodedPath}`;
+}
+
+function decodeLocalFilePath(href: string): string {
+  const withoutScheme = href.startsWith("file://") ? href.slice("file://".length) : href;
+  try {
+    return decodeURIComponent(withoutScheme);
+  } catch {
+    return withoutScheme;
+  }
+}
+
+function formatLocalFileLabel(hrefOrPath: string): string {
+  const path = decodeLocalFilePath(hrefOrPath);
+  const projectMatch = path.match(/^\/mnt\/[A-Za-z]\/Projects\/([^/]+)\/(.+)$/);
+  if (projectMatch) return `${projectMatch[1]}/${projectMatch[2]}`;
+
+  const driveMatch = path.match(/^\/mnt\/([A-Za-z])\/(.+)$/);
+  if (driveMatch) return `${driveMatch[1].toUpperCase()}:/${driveMatch[2]}`;
+
+  return path;
+}
+
+function escapeMarkdownLinkLabel(label: string): string {
+  return label.replace(/\\/g, "\\\\").replace(/]/g, "\\]").replace(/\[/g, "\\[");
+}
+
+function linkifyLocalFileReferences(markdown: string): string {
+  let inFence = false;
+  return markdown
+    .split("\n")
+    .map((line) => {
+      if (/^\s*(?:```|~~~)/.test(line)) {
+        inFence = !inFence;
+        return line;
+      }
+      if (inFence || line.includes("](")) return line;
+
+      return line.replace(localFileReferencePattern, (match) => {
+        const trailing = match.match(/[.,;:]+$/)?.[0] ?? "";
+        const raw = trailing ? match.slice(0, -trailing.length) : match;
+        if (!raw || !isLocalFileHref(raw)) return match;
+
+        const href = normalizeLocalFileHref(raw);
+        const label = formatLocalFileLabel(href);
+        return `[${escapeMarkdownLinkLabel(label)}](${href})${trailing}`;
+      });
+    })
+    .join("\n");
+}
+
 function safeMarkdownUrlTransform(url: string): string {
+  if (isLocalFileHref(url)) return normalizeLocalFileHref(url);
   return parseMentionChipHref(url) ? url : defaultUrlTransform(url);
 }
 
@@ -678,6 +751,23 @@ export function MarkdownBody({
           </a>
         );
       }
+      if (isLocalFileHref(href)) {
+        const targetHref = normalizeLocalFileHref(href ?? "");
+        const label = formatLocalFileLabel(targetHref);
+        return (
+          <a
+            href={targetHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={decodeLocalFilePath(targetHref)}
+            className="inline-flex max-w-full items-center gap-1 rounded-md border border-border/70 bg-muted/60 px-1.5 py-0.5 align-baseline font-mono text-[0.9em] leading-tight text-sky-700 no-underline hover:bg-muted dark:text-sky-300"
+            style={mergeWrapStyle(linkStyle as React.CSSProperties | undefined)}
+          >
+            <FileText aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 truncate">{label}</span>
+          </a>
+        );
+      }
       const isGitHubLink = isGitHubUrl(href);
       const isExternal = isExternalHttpUrl(href);
       const leadingIcon = isGitHubLink ? (
@@ -729,7 +819,7 @@ export function MarkdownBody({
         components={components}
         urlTransform={safeMarkdownUrlTransform}
       >
-        {children}
+        {linkifyLocalFileReferences(children)}
       </Markdown>
     </div>
   );

@@ -118,6 +118,25 @@ describe("MarkdownBody", () => {
     expect(html).toContain('data-mention-kind="routine"');
   });
 
+  it("renders local file references as compact file chips", () => {
+    const html = renderMarkdown(
+      "Changed:\n/mnt/e/Projects/POTI/docs/plans/opportunities-v1-feed-ux.md\nPreview: file:///mnt/e/Projects/POTI/docs/plans/opportunities-v1-feed-ux-prototype.html.",
+    );
+
+    expect(html).toContain('href="file:///mnt/e/Projects/POTI/docs/plans/opportunities-v1-feed-ux.md"');
+    expect(html).toContain('href="file:///mnt/e/Projects/POTI/docs/plans/opportunities-v1-feed-ux-prototype.html"');
+    expect(html).toContain("POTI/docs/plans/opportunities-v1-feed-ux.md");
+    expect(html).toContain("POTI/docs/plans/opportunities-v1-feed-ux-prototype.html");
+    expect(html).toContain("lucide-file-text");
+  });
+
+  it("does not linkify local file references inside fenced code", () => {
+    const html = renderMarkdown("```text\n/mnt/e/Projects/POTI/secret.txt\n```");
+
+    expect(html).not.toContain('href="file:///mnt/e/Projects/POTI/secret.txt"');
+    expect(html).toContain("/mnt/e/Projects/POTI/secret.txt");
+  });
+
   it("sanitizes unsafe javascript markdown links", () => {
     const html = renderMarkdown("[click me](javascript:alert(document.cookie))");
 

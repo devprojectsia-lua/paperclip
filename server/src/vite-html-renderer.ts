@@ -16,9 +16,10 @@ export interface CachedViteHtmlRenderer {
 }
 
 const WATCHER_EVENTS: ViteWatcherEvent[] = ["add", "change", "unlink"];
-const MAIN_ENTRY_TAG = '<script type="module" src="/src/main.tsx"></script>';
-const VITE_CLIENT_TAG = '<script type="module" src="/@vite/client"></script>';
-const REACT_REFRESH_PREAMBLE = `<script type="module">
+const MAIN_ENTRY_TAG = '<script data-cfasync="false" type="module" src="/src/main.tsx"></script>';
+const LEGACY_MAIN_ENTRY_TAG = '<script type="module" src="/src/main.tsx"></script>';
+const VITE_CLIENT_TAG = '<script data-cfasync="false" type="module" src="/@vite/client"></script>';
+const REACT_REFRESH_PREAMBLE = `<script data-cfasync="false" type="module">
 import { injectIntoGlobalHook } from "/@react-refresh";
 injectIntoGlobalHook(window);
 window.$RefreshReg$ = () => {};
@@ -35,6 +36,9 @@ function injectViteDevPreamble(html: string): string {
   if (injectedHtml.includes(VITE_CLIENT_TAG)) return injectedHtml;
   if (injectedHtml.includes(MAIN_ENTRY_TAG)) {
     return injectedHtml.replace(MAIN_ENTRY_TAG, `${VITE_CLIENT_TAG}\n    ${MAIN_ENTRY_TAG}`);
+  }
+  if (injectedHtml.includes(LEGACY_MAIN_ENTRY_TAG)) {
+    return injectedHtml.replace(LEGACY_MAIN_ENTRY_TAG, `${VITE_CLIENT_TAG}\n    ${MAIN_ENTRY_TAG}`);
   }
   return injectedHtml.replace("</body>", `    ${VITE_CLIENT_TAG}\n  </body>`);
 }
