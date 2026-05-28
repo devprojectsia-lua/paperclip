@@ -336,6 +336,16 @@ const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancell
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
+function truncateIssueListDescription<T extends { description: string | null }>(row: T): T {
+  // Keep truncation out of SQL: historical SQL_ASCII rows can fail when SQL slices text
+  // at a client-encoding boundary.
+  if (!row.description || row.description.length <= ISSUE_LIST_DESCRIPTION_MAX_CHARS) return row;
+  return {
+    ...row,
+    description: row.description.slice(0, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+  };
+}
+
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
 }
@@ -361,11 +371,6 @@ function truncateInlineSummary(value: string | null | undefined, maxChars = CHIL
 function truncateByCodePoint(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   return Array.from(value).slice(0, maxChars).join("");
-}
-
-function decodeDatabaseTextPreview(value: string | null | undefined, maxChars: number): string | null {
-  if (value == null) return null;
-  return truncateByCodePoint(Buffer.from(value, "base64").toString("utf8"), maxChars);
 }
 
 function appendAcceptanceCriteriaToDescription(description: string | null | undefined, acceptanceCriteria: string[] | undefined) {
@@ -1595,18 +1600,7 @@ const issueListSelect = {
   goalId: issues.goalId,
   parentId: issues.parentId,
   title: issues.title,
-  description: sql<string | null>`
-    CASE
-      WHEN ${issues.description} IS NULL THEN NULL
-      ELSE encode(
-        substring(
-          convert_to(${issues.description}, current_setting('server_encoding'))
-          FROM 1 FOR ${ISSUE_LIST_DESCRIPTION_MAX_BYTES}
-        ),
-        'base64'
-      )
-    END
-  `,
+  description: issues.description,
   status: issues.status,
   workMode: issues.workMode,
   priority: issues.priority,
@@ -2625,10 +2619,7 @@ async function listBlockedInboxIssues(
     .from(issues)
     .where(and(...conditions))
     .orderBy(desc(issueCanonicalLastActivityAtExpr(companyId)), desc(issues.updatedAt), desc(issues.id)))
-    .map((row: any) => ({
-      ...row,
-      description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
-    }));
+    .map(truncateIssueListDescription);
   const withLabels = await withIssueLabels(dbOrTx, rows);
   const withRuns = withActiveRuns(withLabels, await activeRunMapForIssues(dbOrTx, withLabels));
   if (withRuns.length === 0) return [];
@@ -3585,10 +3576,7 @@ export function issueService(db: Db) {
       const pageQuery = offset > 0
         ? (limit === undefined ? baseQuery.offset(offset) : baseQuery.limit(limit).offset(offset))
         : (limit === undefined ? baseQuery : baseQuery.limit(limit));
-      const rows = (await pageQuery).map((row) => ({
-        ...row,
-        description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
-      }));
+      const rows = (await pageQuery).map(truncateIssueListDescription);
       const withLabels = await withIssueLabels(db, rows);
       const runMap = await activeRunMapForIssues(db, withLabels);
       const withRuns = withActiveRuns(withLabels, runMap);
@@ -3631,7 +3619,7 @@ export function issueService(db: Db) {
             activity?.latestCommentAt ?? null,
             activity?.latestLogAt ?? null,
           ) ?? row.updatedAt;
-          return {
+          return truncateIssueListDescription({
             ...row,
             ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
             lastActivityAt,
@@ -3640,7 +3628,7 @@ export function issueService(db: Db) {
             ...(productivityReviewByIssueId.has(row.id)
               ? { productivityReview: productivityReviewByIssueId.get(row.id) }
               : {}),
-          };
+          });
         });
       }
 
@@ -3653,7 +3641,7 @@ export function issueService(db: Db) {
           activity?.latestCommentAt ?? null,
           activity?.latestLogAt ?? null,
         ) ?? row.updatedAt;
-        return {
+        return truncateIssueListDescription({
           ...row,
           ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
           lastActivityAt,
@@ -3667,7 +3655,7 @@ export function issueService(db: Db) {
             myLastReadAt: readByIssueId.get(row.id) ?? null,
             lastExternalCommentAt: statsByIssueId.get(row.id)?.lastExternalCommentAt ?? null,
           }),
-        };
+        });
       });
     },
 
