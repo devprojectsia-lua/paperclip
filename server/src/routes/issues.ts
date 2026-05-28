@@ -82,7 +82,7 @@ import {
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertActorScope, assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -1384,6 +1384,7 @@ export function issueRoutes(
     res: Response,
     issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
   ) {
+    if (req.actor.type === "service") return true;
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
@@ -5468,6 +5469,28 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, issue.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+
+    // Service-token fast path: scope check + force authorType=system
+    if (req.actor.type === "service") {
+      if (!assertActorScope(req, res, "comments:write")) return;
+      if (req.body.authorType && req.body.authorType !== "system") {
+        res.status(422).json({ error: "Service tokens must use authorType=system" });
+        return;
+      }
+      const comment = await svc.addComment(id, req.body.body, {
+        agentId: undefined,
+        userId: undefined,
+        runId: req.actor.runId,
+      }, {
+        authorType: "system",
+        presentation: req.body.presentation ?? null,
+        metadata: req.body.metadata ?? null,
+      });
+      await issueReferencesSvc.syncComment(comment.id);
+      res.status(201).json(comment);
+      return;
+    }
+
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,

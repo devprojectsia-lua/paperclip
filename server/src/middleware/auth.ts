@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, agents, authUsers, companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, agents, authUsers, companies, companyMemberships, instanceUserRoles, serviceTokens } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
@@ -136,6 +136,25 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       .then((rows) => rows[0] ?? null);
 
     if (!key) {
+      const serviceToken = await db
+        .select()
+        .from(serviceTokens)
+        .where(and(eq(serviceTokens.tokenHash, tokenHash), isNull(serviceTokens.revokedAt)))
+        .then((rows) => rows[0] ?? null);
+      if (serviceToken) {
+        await db.update(serviceTokens).set({ lastUsedAt: new Date() }).where(eq(serviceTokens.id, serviceToken.id));
+        req.actor = {
+          type: "service",
+          serviceTokenId: serviceToken.id,
+          companyId: serviceToken.companyId,
+          scopes: serviceToken.scopes,
+          runId: runIdHeader || undefined,
+          source: "service_token",
+        };
+        next();
+        return;
+      }
+
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
         next();

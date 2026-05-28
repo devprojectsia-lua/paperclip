@@ -1,4 +1,4 @@
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import { forbidden, unauthorized } from "../errors.js";
 
 export function assertAuthenticated(req: Request) {
@@ -39,8 +39,23 @@ export function assertInstanceAdmin(req: Request) {
   throw forbidden("Instance admin access required");
 }
 
+export function actorHasScope(actor: Express.Request["actor"], scope: string): boolean {
+  return actor.type === "service" && Array.isArray(actor.scopes) && actor.scopes.includes(scope);
+}
+
+export function assertActorScope(req: Request, res: Response, scope: string): boolean {
+  if (req.actor.type !== "service" || !Array.isArray(req.actor.scopes) || !req.actor.scopes.includes(scope)) {
+    res.status(403).json({ error: `Missing required scope: ${scope}`, details: { actorType: req.actor.type } });
+    return false;
+  }
+  return true;
+}
+
 export function assertCompanyAccess(req: Request, companyId: string) {
   assertAuthenticated(req);
+  if (req.actor.type === "service" && req.actor.companyId !== companyId) {
+    throw forbidden("Service token cannot access another company");
+  }
   if (req.actor.type === "agent" && req.actor.companyId !== companyId) {
     throw forbidden("Agent key cannot access another company");
   }
@@ -70,6 +85,15 @@ export function getActorInfo(req: Request) {
       actorType: "agent" as const,
       actorId: req.actor.agentId ?? "unknown-agent",
       agentId: req.actor.agentId ?? null,
+      runId: req.actor.runId ?? null,
+    };
+  }
+
+  if (req.actor.type === "service") {
+    return {
+      actorType: "system" as const,
+      actorId: req.actor.serviceTokenId ?? "service-token",
+      agentId: null as string | null,
       runId: req.actor.runId ?? null,
     };
   }
