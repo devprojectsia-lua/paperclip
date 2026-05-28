@@ -60,6 +60,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { computeProcessLostBackoffDecision } from "../heartbeat-process-lost-backoff.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -2566,6 +2567,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // SPC-6121: gate the continuation requeue with exponential backoff once
+      // the same issue accumulates >=5 consecutive `process_lost` failures in
+      // a 5-minute window. Without this, the sweep re-fires at its native
+      // ~11s cadence and amplifies a transient host outage into a
+      // multi-hundred run storm even when `enqueueProcessLossRetry` has
+      // already deferred via scheduled_retry.
+      const processLostBackoff = await computeProcessLostBackoffDecision(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        now: new Date(),
+      });
+      if (processLostBackoff.remainingDelayMs > 0) {
         result.skipped += 1;
         continue;
       }
