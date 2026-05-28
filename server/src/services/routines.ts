@@ -1880,6 +1880,9 @@ export function routineService(
         });
         return { deleted: true, revision: appended.revision };
       });
+      if (result.deleted && existing.secretId) {
+        await secretsSvc.remove(existing.secretId);
+      }
       return result;
     },
 
