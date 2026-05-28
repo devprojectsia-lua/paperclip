@@ -771,6 +771,17 @@ async function ensureManagedProjectWorkspace(input: {
   }
 }
 
+async function isGitCheckoutCwd(cwd: string): Promise<boolean> {
+  try {
+    await execFile("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+      env: sanitizeRuntimeServiceBaseEnv(process.env),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
 
@@ -1096,6 +1107,29 @@ export type ResolvedWorkspaceForRun = {
 type ProjectWorkspaceCandidate = {
   id: string;
 };
+
+export function resolveProjectWorkspaceIssueProjectId(input: {
+  issueProjectId: string | null;
+  contextProjectId: string | null;
+  requireGitBackedWorkspace?: boolean | null;
+  activeProjectIds: string[];
+}): { projectId: string | null; inferredProjectWarning: string | null } {
+  const projectId = input.issueProjectId ?? input.contextProjectId;
+  if (projectId || !input.requireGitBackedWorkspace) {
+    return { projectId, inferredProjectWarning: null };
+  }
+
+  if (input.activeProjectIds.length !== 1) {
+    return { projectId: null, inferredProjectWarning: null };
+  }
+
+  const inferredProjectId = input.activeProjectIds[0]!;
+  return {
+    projectId: inferredProjectId,
+    inferredProjectWarning:
+      `Issue requested an isolated workspace without a project; using the only active project "${inferredProjectId}" for workspace resolution.`,
+  };
+}
 
 export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWorkspaceCandidate>(
   rows: T[],
@@ -3602,7 +3636,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null },
+    opts?: { useProjectWorkspace?: boolean | null; requireGitBackedWorkspace?: boolean | null },
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     const contextProjectId = readNonEmptyString(context.projectId);
@@ -3618,9 +3652,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null)
       : null;
     const issueProjectId = issueProjectRef?.projectId ?? null;
+    const activeProjectIds =
+      !issueProjectId && !contextProjectId && opts?.requireGitBackedWorkspace
+        ? await db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(and(eq(projects.companyId, agent.companyId), eq(projects.status, "in_progress")))
+        .orderBy(asc(projects.createdAt), asc(projects.id))
+        .limit(2)
+        .then((rows) => rows.map((row) => row.id))
+        : [];
+    const projectResolution = resolveProjectWorkspaceIssueProjectId({
+      issueProjectId,
+      contextProjectId,
+      requireGitBackedWorkspace: opts?.requireGitBackedWorkspace,
+      activeProjectIds,
+    });
+    const inferredProjectWarning = projectResolution.inferredProjectWarning;
     const preferredProjectWorkspaceId =
       issueProjectRef?.projectWorkspaceId ?? contextProjectWorkspaceId ?? null;
-    const resolvedProjectId = issueProjectId ?? contextProjectId;
+    const resolvedProjectId = projectResolution.projectId;
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
 
@@ -3694,7 +3745,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             workspaceHints,
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
-            ),
+            ).concat(inferredProjectWarning ? [inferredProjectWarning] : []),
           };
         }
         if (preferredWorkspace?.id === workspace.id) {
@@ -3731,7 +3782,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
         repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
         workspaceHints,
-        warnings,
+        warnings: inferredProjectWarning ? [inferredProjectWarning, ...warnings] : warnings,
       };
     }
 
@@ -3749,7 +3800,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoUrl: null,
         repoRef: null,
         workspaceHints,
-        warnings: managedWorkspace.warning ? [managedWorkspace.warning] : [],
+        warnings: [
+          ...(inferredProjectWarning ? [inferredProjectWarning] : []),
+          ...(managedWorkspace.warning ? [managedWorkspace.warning] : []),
+        ],
       };
     }
 
@@ -3760,7 +3814,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .stat(sessionCwd)
         .then((stats) => stats.isDirectory())
         .catch(() => false);
-      if (sessionCwdExists) {
+      if (sessionCwdExists && (!opts?.requireGitBackedWorkspace || await isGitCheckoutCwd(sessionCwd))) {
         return {
           cwd: sessionCwd,
           source: "task_session" as const,
@@ -3769,7 +3823,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
           workspaceHints,
-          warnings: [],
+          warnings: inferredProjectWarning ? [inferredProjectWarning] : [],
         };
       }
     }
@@ -3777,9 +3831,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
     await fs.mkdir(cwd, { recursive: true });
     const warnings: string[] = [];
+    if (inferredProjectWarning) {
+      warnings.push(inferredProjectWarning);
+    }
     if (sessionCwd && sessionCwdLooksUnsafe) {
       warnings.push(
         `Saved session workspace "${sessionCwd}" points at a system temp root and was rejected as untrusted. Using fallback workspace "${cwd}" for this run.`,
+      );
+    } else if (sessionCwd && opts?.requireGitBackedWorkspace) {
+      warnings.push(
+        `Saved session workspace "${sessionCwd}" is not a git checkout. Using fallback workspace "${cwd}" for this run.`,
       );
     } else if (sessionCwd) {
       warnings.push(
@@ -7081,6 +7142,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const config = parseObject(agent.adapterConfig);
     const requestedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
+      issuePreference: isolatedWorkspacesEnabled
+        ? issueContext?.executionWorkspacePreference
+        : null,
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
     });
@@ -7088,7 +7152,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       context,
       previousSessionParams,
-      { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
+      {
+        useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+        requireGitBackedWorkspace: requestedExecutionWorkspaceMode === "isolated_workspace",
+      },
     );
     const issueRef = issueContext
       ? {
@@ -7207,6 +7274,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : buildExecutionWorkspaceAdapterConfig({
           agentConfig: config,
           projectPolicy: projectExecutionWorkspacePolicy,
+          issuePreference: isolatedWorkspacesEnabled
+            ? issueContext?.executionWorkspacePreference
+            : null,
           issueSettings: issueExecutionWorkspaceSettings,
           mode: requestedExecutionWorkspaceMode,
           legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
@@ -7458,6 +7528,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         requestedExecutionWorkspaceMode === "isolated_workspace" ||
         requestedExecutionWorkspaceMode === "operator_branch";
       const nextIssuePatch: Record<string, unknown> = {};
+      if (resolvedProjectId && issueRef?.projectId !== resolvedProjectId) {
+        nextIssuePatch.projectId = resolvedProjectId;
+      }
       if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
         nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
       }
