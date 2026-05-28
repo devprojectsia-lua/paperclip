@@ -645,6 +645,13 @@
       "when": 1778810394522,
       "tag": "0091_old_swarm",
       "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1778966210569,
+      "tag": "0092_plugin_config_company_scope",
+      "breakpoints": true
     }
   ]
 }
