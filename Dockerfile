@@ -3,7 +3,7 @@ FROM node:lts-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
+  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 awscli ffmpeg imagemagick graphicsmagick \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 
@@ -21,6 +21,7 @@ COPY ui/package.json ui/
 COPY packages/shared/package.json packages/shared/
 COPY packages/db/package.json packages/db/
 COPY packages/adapter-utils/package.json packages/adapter-utils/
+COPY packages/plugins/sdk/package.json packages/plugins/sdk/
 COPY packages/mcp-server/package.json packages/mcp-server/
 COPY packages/skills-catalog/package.json packages/skills-catalog/
 COPY packages/adapters/acpx-local/package.json packages/adapters/acpx-local/
@@ -47,6 +48,8 @@ FROM base AS build
 WORKDIR /app
 COPY --from=deps /app /app
 COPY . .
+RUN pnpm --filter @paperclipai/shared build
+RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/server build
@@ -65,7 +68,9 @@ RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/cod
   && chown node:node /paperclip
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY scripts/docker-onboard-from-env.sh /usr/local/bin/
+COPY scripts/onboard-bootstrap-invite.mts /app/server/_onboard-bootstrap-invite.mts
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-onboard-from-env.sh
 
 ENV NODE_ENV=production \
   HOME=/paperclip \
@@ -79,10 +84,13 @@ ENV NODE_ENV=production \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+  OPENCODE_CONFIG=/paperclip/.config/opencode/opencode.json \
   OPENCODE_ALLOW_ALL_MODELS=true
+
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 
 VOLUME ["/paperclip"]
 EXPOSE 3100
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["docker-onboard-from-env.sh"]
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
