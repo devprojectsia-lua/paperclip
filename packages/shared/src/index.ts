@@ -322,6 +322,7 @@ export type {
   AgentChainOfCommandEntry,
   AgentDetail,
   AgentPermissions,
+  AgentRuntimeIdentity,
   AgentInstructionsBundleMode,
   AgentInstructionsFileSummary,
   AgentInstructionsFileDetail,
