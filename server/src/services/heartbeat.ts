@@ -37,6 +37,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issuePlanDecompositions,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -1931,6 +1932,59 @@ function normalizeInteractionContinuationWakeContext(
 ) {
   if (isInteractionResolutionWakePayload(payload)) return;
   clearInteractionContinuationWakeContext(contextSnapshot);
+}
+
+type AcceptedPlanWakeRoutingDecision = {
+  otherActiveClaimIssueId: string;
+  otherActiveClaimIdentifier: string | null;
+  otherActiveClaimTitle: string;
+  forceFreshSession: boolean;
+  suppressAcceptedContinuation: boolean;
+};
+
+async function resolveAcceptedPlanWakeRoutingDecision(args: {
+  db: Db;
+  companyId: string;
+  agentId: string;
+  issueId: string | null;
+  issueWorkMode: string | null | undefined;
+  contextSnapshot: Record<string, unknown>;
+}): Promise<AcceptedPlanWakeRoutingDecision | null> {
+  if (args.issueId === null) return null;
+  if (args.issueWorkMode !== "planning") return null;
+
+  const activeClaims = await args.db
+    .select({
+      sourceIssueId: issuePlanDecompositions.sourceIssueId,
+      identifier: issues.identifier,
+      title: issues.title,
+    })
+    .from(issuePlanDecompositions)
+    .innerJoin(issues, eq(issues.id, issuePlanDecompositions.sourceIssueId))
+    .where(and(
+      eq(issuePlanDecompositions.companyId, args.companyId),
+      eq(issuePlanDecompositions.ownerAgentId, args.agentId),
+      eq(issuePlanDecompositions.status, "in_flight"),
+    ))
+    .orderBy(desc(issuePlanDecompositions.updatedAt), asc(issuePlanDecompositions.createdAt));
+
+  if (activeClaims.length === 0) return null;
+  if (activeClaims.some((claim) => claim.sourceIssueId === args.issueId)) return null;
+
+  const otherActiveClaim = activeClaims[0];
+  if (!otherActiveClaim) return null;
+
+  const hasAcceptedContinuationWake =
+    readNonEmptyString(args.contextSnapshot.interactionKind) === "request_confirmation" &&
+    readNonEmptyString(args.contextSnapshot.interactionStatus) === "accepted";
+
+  return {
+    otherActiveClaimIssueId: otherActiveClaim.sourceIssueId,
+    otherActiveClaimIdentifier: otherActiveClaim.identifier ?? null,
+    otherActiveClaimTitle: otherActiveClaim.title,
+    forceFreshSession: true,
+    suppressAcceptedContinuation: hasAcceptedContinuationWake,
+  };
 }
 
 export function mergeCoalescedContextSnapshot(
@@ -7055,6 +7109,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(projects.id, executionProjectId), eq(projects.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
+    const acceptedPlanWakeRoutingDecision = issueContext
+      ? await resolveAcceptedPlanWakeRoutingDecision({
+          db,
+          companyId: agent.companyId,
+          agentId: agent.id,
+          issueId,
+          issueWorkMode: issueContext.workMode,
+          contextSnapshot: context,
+        })
+      : null;
+    if (acceptedPlanWakeRoutingDecision) {
+      context.forceFreshSession = true;
+      context.acceptedPlanWakeRouting = {
+        reason: "other_issue_claim_in_flight",
+        otherActiveClaimIssueId: acceptedPlanWakeRoutingDecision.otherActiveClaimIssueId,
+        otherActiveClaimIdentifier: acceptedPlanWakeRoutingDecision.otherActiveClaimIdentifier,
+        otherActiveClaimTitle: acceptedPlanWakeRoutingDecision.otherActiveClaimTitle,
+      };
+      if (acceptedPlanWakeRoutingDecision.suppressAcceptedContinuation) {
+        clearInteractionContinuationWakeContext(context);
+      }
+    } else {
+      delete context.acceptedPlanWakeRouting;
+    }
     const routineEnvContext = await getRoutineEnvForExecutionIssue(agent.companyId, issueContext);
     const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
       parseProjectExecutionWorkspacePolicy(projectContext?.executionWorkspacePolicy),
